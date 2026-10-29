@@ -48,8 +48,17 @@ function rowById(id: number): OutboxRow {
   };
 }
 
-function make(send: NotifySend, extra: { tickMs?: number; backoffMs?: (n: number) => number } = {}): Notifier {
-  notifier = createNotifier({ store, send, tickMs: extra.tickMs ?? 60_000, backoffMs: extra.backoffMs });
+function make(
+  send: NotifySend,
+  extra: { tickMs?: number; backoffMs?: (n: number) => number; now?: () => number } = {}
+): Notifier {
+  notifier = createNotifier({
+    store,
+    send,
+    tickMs: extra.tickMs ?? 60_000,
+    backoffMs: extra.backoffMs,
+    now: extra.now,
+  });
   return notifier;
 }
 
@@ -198,5 +207,79 @@ describe("notifier", () => {
     addOutbox();
     n.wake();
     await waitFor(() => sent.length === 1);
+  });
+
+  test("other error waits now + backoffMs(attempts)", async () => {
+    addOutbox();
+    const base = Date.now() + 60_000; // injected clock, past the row's real next_attempt_at
+    const asked: number[] = [];
+    make(
+      async () => {
+        throw new Error("ECONNRESET");
+      },
+      {
+        now: () => base,
+        backoffMs: (n) => {
+          asked.push(n);
+          return n * 1000;
+        },
+      }
+    ).start();
+    await waitFor(() => rows()[0].attempts === 1);
+    expect(asked).toEqual([1]);
+    expect(rows()[0].nextAttemptAt).toBe(base + 1000);
+    expect(rows()[0].state).toBe("pending");
+  });
+
+  test("429 without retryAfter waits now + backoffMs(attempts + 1)", async () => {
+    addOutbox();
+    const base = Date.now() + 60_000; // injected clock, past the row's real next_attempt_at
+    const asked: number[] = [];
+    make(
+      async () => {
+        throw new TelegramApiError("sendMessage", 429, "Too Many Requests");
+      },
+      {
+        now: () => base,
+        backoffMs: (n) => {
+          asked.push(n);
+          return n * 1000;
+        },
+      }
+    ).start();
+    await waitFor(() => rows()[0].lastError !== null);
+    expect(asked).toEqual([1]);
+    expect(rows()[0].nextAttemptAt).toBe(base + 1000);
+    expect(rows()[0].attempts).toBe(0);
+  });
+
+  test("passes never overlap", async () => {
+    addOutbox();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let calls = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const n = make(async () => {
+      calls++;
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await gate;
+      inFlight--;
+    });
+    n.start();
+    await waitFor(() => calls === 1);
+    n.wake();
+    n.wake();
+    n.wake();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(maxInFlight).toBe(1);
+    expect(calls).toBe(1);
+    release();
+    await waitFor(() => rows()[0].state === "sent");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(calls).toBe(1);
   });
 });
