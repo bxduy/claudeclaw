@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { TelegramApiError, callApi, sendMessage } from "../commands/telegram";
+import { TelegramApiError, callApi, pollBackoffMs, sendMessage } from "../commands/telegram";
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -80,5 +80,21 @@ describe("sendMessage", () => {
     expect(calls.length).toBe(3);
     expect(calls[1].body.parse_mode).toBeUndefined();
     expect(calls[2].body.parse_mode).toBeUndefined();
+  });
+});
+
+describe("pollBackoffMs", () => {
+  test("first failure waits 1-2s", () => {
+    expect(pollBackoffMs(1, () => 0)).toBe(1000);
+    expect(pollBackoffMs(1, () => 1)).toBe(2000);
+  });
+
+  test("grows exponentially", () => {
+    expect(pollBackoffMs(3, () => 0)).toBe(4000);
+  });
+
+  test("caps at 60s", () => {
+    expect(pollBackoffMs(10, () => 0)).toBe(30000);
+    expect(pollBackoffMs(10, () => 1)).toBe(60000);
   });
 });

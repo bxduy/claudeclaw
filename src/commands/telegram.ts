@@ -1822,6 +1822,12 @@ let isPolling = false;
 // increments the counter, even if a long-poll request is still in flight.
 let pollingGeneration = 0;
 
+/** Jittered exponential backoff: cap = min(60s, 1s * 2^failures), result in [cap/2, cap]. */
+export function pollBackoffMs(failures: number, rand: () => number = Math.random): number {
+  const cap = Math.min(60_000, 1000 * 2 ** failures);
+  return cap / 2 + rand() * (cap / 2);
+}
+
 async function poll(generation: number): Promise<void> {
   const config = getSettings().telegram;
   let offset = 0;
@@ -1844,6 +1850,7 @@ async function poll(generation: number): Promise<void> {
   // Register available skills as bot command menu (non-blocking)
   registerBotCommands(config.token).catch(() => {});
 
+  let failures = 0;
   while (running && pollingGeneration === generation) {
     try {
       const data = await callApi<{ ok: boolean; result: TelegramUpdate[] }>(
@@ -1855,7 +1862,13 @@ async function poll(generation: number): Promise<void> {
       // Check generation after the in-flight long-poll request returns.
       if (pollingGeneration !== generation) break;
 
-      if (!data.ok || !data.result.length) continue;
+      if (!data.ok) {
+        failures++;
+        await Bun.sleep(pollBackoffMs(failures));
+        continue;
+      }
+      failures = 0;
+      if (!data.result.length) continue;
 
       for (const update of data.result) {
         debugLog(
@@ -1888,7 +1901,12 @@ async function poll(generation: number): Promise<void> {
       if (pollingGeneration !== generation) break;
       if (!running) break;
       console.error(`[Telegram] Poll error: ${err instanceof Error ? err.message : err}`);
-      await Bun.sleep(5000);
+      if (err instanceof TelegramApiError && err.code === 429 && err.retryAfter) {
+        await Bun.sleep(err.retryAfter * 1000);
+      } else {
+        failures++;
+        await Bun.sleep(pollBackoffMs(failures));
+      }
     }
   }
 
@@ -1934,7 +1952,8 @@ export function startPolling(debug = false): void {
   const gen = ++pollingGeneration;
   (async () => {
     await ensureProjectClaudeMd();
-    await runPendingResumeTelegram().catch((err) =>
+    // Resume errors stay isolated (commit 99358ba) but polling no longer waits for resume.
+    runPendingResumeTelegram().catch((err) =>
       console.error(`[Telegram] Pending resume failed: ${err instanceof Error ? err.message : err}`)
     );
     await poll(gen);
