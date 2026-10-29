@@ -399,7 +399,10 @@ function resolveTimeoutMs(name: string): number {
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
 async function collectStream(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<string> {
-  const reader = stream.getReader();
+  return collectReader(stream.getReader(), maxBytes);
+}
+
+async function collectReader(reader: ReadableStreamDefaultReader<Uint8Array>, maxBytes: number): Promise<string> {
   const chunks: Uint8Array[] = [];
   let totalBytes = 0;
   try {
@@ -629,6 +632,9 @@ export const TASK_SYSTEM_PROMPT =
 export const TASK_DISALLOWED_TOOLS = ["Bash(gh pr merge:*)"];
 
 const TASK_KILL_GRACE_MS = 5000;
+// After exit, how long to wait for stdout/stderr to close. A process that left the
+// group (setsid) can hold the pipes open indefinitely.
+const TASK_DRAIN_MS = 2000;
 
 export interface TaskRunOptions {
   prompt: string;
@@ -721,6 +727,7 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
   let reason: TaskRunResult["reason"];
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  let exited = false;
 
   const stop = (why: "timeout" | "idle" | "cancelled", sig: "SIGTERM" | "SIGKILL" = "SIGTERM") => {
     reason ??= why;
@@ -732,7 +739,7 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
     }
   };
   const armIdle = () => {
-    if (reason) return;
+    if (reason || exited) return;
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => stop("idle"), opts.idleTimeoutMs);
   };
@@ -775,13 +782,14 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
     }
   };
 
+  const stdoutReader = proc.stdout.getReader();
+  const stderrReader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
   const readStdout = async () => {
-    const reader = proc.stdout.getReader();
     const decoder = new TextDecoder();
     let buf = "";
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await stdoutReader.read();
         if (done) break;
         buf += decoder.decode(value, { stream: true });
         const lines = buf.split("\n");
@@ -791,26 +799,43 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
       buf += decoder.decode();
       if (buf) handleLine(buf);
     } finally {
-      reader.releaseLock();
+      stdoutReader.releaseLock();
     }
   };
 
-  const stdoutDone = readStdout();
-  const stderrDone = collectStream(proc.stderr as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES);
+  const drained = Promise.all([readStdout(), collectReader(stderrReader, MAX_OUTPUT_BYTES)]);
+  // Not awaited until the process exits; keep an early read error from surfacing as unhandled.
+  drained.catch(() => {});
 
-  let exitCode: number;
-  let stderr: string;
-  try {
-    exitCode = await proc.exited;
-    // Kill anything claude left behind in its group; this also closes pipes they hold.
-    signalGroup(pgid, "SIGKILL");
-    [, stderr] = await Promise.all([stdoutDone, stderrDone]);
-    await waitForGroupExit(pgid, 1000);
-  } finally {
+  // Idempotent: once the process has exited nothing may relabel or re-signal the run.
+  const disarm = () => {
+    exited = true;
     clearTimeout(idleTimer);
     clearTimeout(totalTimer);
     clearTimeout(graceTimer);
     opts.signal?.removeEventListener("abort", onAbort);
+  };
+
+  let exitCode: number;
+  let stderr: string;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    exitCode = await proc.exited;
+    disarm();
+    // Kill anything claude left behind in its group; this also closes pipes they hold.
+    signalGroup(pgid, "SIGKILL");
+    const expired = new Promise<"expired">((resolve) => {
+      drainTimer = setTimeout(() => resolve("expired"), TASK_DRAIN_MS);
+    });
+    if ((await Promise.race([drained, expired])) === "expired") {
+      // Cancelling ends the pending reads; keep whatever was read so far.
+      await Promise.all([stdoutReader.cancel(), stderrReader.cancel()]).catch(() => {});
+    }
+    [, stderr] = await drained;
+    await waitForGroupExit(pgid, 1000);
+  } finally {
+    clearTimeout(drainTimer);
+    disarm();
   }
   stderr = stderr.trim();
 

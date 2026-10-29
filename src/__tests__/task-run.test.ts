@@ -66,7 +66,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const pid of [...readPids(pidsFile), ...readPids(join(dir, "child.pid"))]) {
+  for (const pid of [...readPids(pidsFile), ...readPids(join(dir, "child.pid")), ...readPids(join(dir, "setsid.pids"))]) {
     try { process.kill(-pid, "SIGKILL"); } catch {}
     try { process.kill(pid, "SIGKILL"); } catch {}
   }
@@ -224,6 +224,35 @@ describe("runTaskClaude", () => {
     expect(groupAlive(pid!)).toBe(false);
     // SIGKILL went out synchronously, so no 5 s SIGTERM grace was waited for.
     expect(returnedAt - abortedAt).toBeLessThan(1000);
+  }, 15_000);
+
+  // The setsid child sits outside the group, so the group kill cannot close the stdout it inherited.
+  function exitWithStdoutHolder(holdSeconds: number): string {
+    return fakeClaude([
+      `echo '{"type":"result","result":"done"}'`,
+      `setsid sleep ${holdSeconds} &`,
+      `echo $! >> "${join(dir, "setsid.pids")}"`,
+      "sleep 0.3",
+      "exit 0",
+    ].join("\n"));
+  }
+
+  test("clean exit is not relabelled", async () => {
+    const exe = exitWithStdoutHolder(3);
+    const start = Date.now();
+    const res = await runTaskClaude(opts(exe, { idleTimeoutMs: 1000 }));
+    expect(Date.now() - start).toBeLessThan(3000);
+    expect(res.reason).toBeUndefined();
+    expect(res.result).toBe("done");
+    expect(res.exitCode).toBe(0);
+  }, 15_000);
+
+  test("unbounded drain is cut", async () => {
+    const exe = exitWithStdoutHolder(30);
+    const start = Date.now();
+    const res = await runTaskClaude(opts(exe));
+    expect(Date.now() - start).toBeLessThan(5000);
+    expect(res.exitCode).toBe(0);
   }, 15_000);
 
   // Keep last: rate-limit state is a module-level global that cannot be reset.
