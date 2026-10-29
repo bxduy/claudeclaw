@@ -265,15 +265,32 @@ function persistRunCount(): void {
   } catch {}
 }
 
-function enqueue<T>(fn: () => Promise<T>, threadId?: string): Promise<T> {
+// Queued + running job count per queue key ("" = global queue).
+const inFlight = new Map<string, number>();
+
+/** True while any job (queued or running) exists for the key; no key = global queue. */
+export function isSessionBusy(key?: string): boolean {
+  return (inFlight.get(key || "") ?? 0) > 0;
+}
+
+export function enqueue<T>(fn: () => Promise<T>, threadId?: string): Promise<T> {
+  const key = threadId || "";
+  inFlight.set(key, (inFlight.get(key) ?? 0) + 1);
+  const dec = () => {
+    const n = (inFlight.get(key) ?? 1) - 1;
+    if (n <= 0) inFlight.delete(key);
+    else inFlight.set(key, n);
+  };
   if (threadId) {
     const current = threadQueues.get(threadId) ?? Promise.resolve();
     const task = current.then(fn, fn);
     threadQueues.set(threadId, task.then(() => {}, () => {}));
+    task.then(dec, dec);
     return task;
   }
   const task = globalQueue.then(fn, fn);
   globalQueue = task.then(() => {}, () => {});
+  task.then(dec, dec);
   return task;
 }
 
