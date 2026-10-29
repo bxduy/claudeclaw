@@ -13,6 +13,8 @@ import { findSessionJsonlPath } from "../sessionFiles";
 import { resolveSkillPrompt, listSkills } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
+import { getTaskRuntime } from "../tasks/runtime";
+import { taskCommandReply } from "../tasks/commands";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---
@@ -1135,6 +1137,12 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  const taskReply = taskCommandReply(command, text, { chatId, threadId, userId }, getTaskRuntime());
+  if (taskReply !== null) {
+    await sendMessage(config.token, chatId, taskReply, threadId);
+    return;
+  }
+
   if (command === "/status") {
     const session = sessionKey ? await peekThreadSession(sessionKey) : await peekSession();
     const settings = getSettings();
@@ -1415,7 +1423,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
     // Skill routing: resolve slash commands to SKILL.md prompts
     let skillContext: string | null = null;
-    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/kill" && command !== "/verbose" && command !== "/fork" && command !== "/mode") {
+    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/kill" && command !== "/verbose" && command !== "/fork" && command !== "/mode" && command !== "/task" && command !== "/tasks" && command !== "/cancel") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -1781,6 +1789,9 @@ async function registerBotCommands(token: string): Promise<void> {
       // Control
       { command: "fork", description: "🍴 Run parallel task" },
       { command: "kill", description: "⛔ Stop current agent" },
+      { command: "task", description: "📋 Queue a background task" },
+      { command: "tasks", description: "📋 List recent tasks" },
+      { command: "cancel", description: "🚫 Cancel a queued task" },
     ];
     for (const skill of skills) {
       // Telegram commands: 1-32 chars, lowercase a-z, 0-9, underscores only
@@ -1803,7 +1814,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modeldefault"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "kill", "verbose", "fork", "mode", "model", "modelhaiku", "modelsonnet", "modelopus", "modeldefault", "task", "tasks", "cancel"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
