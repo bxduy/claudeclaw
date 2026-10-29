@@ -25,7 +25,13 @@ export function initTaskRuntime(opts: {
     tickMs: opts.schedulerTickMs,
   });
   scheduler.start();
-  const runtime: TaskRuntime = { store, scheduler, notifier, getMaxWorkers: opts.getMaxWorkers };
+  const runtime: TaskRuntime = {
+    store,
+    scheduler,
+    notifier,
+    getMaxWorkers: opts.getMaxWorkers,
+    cancel: (id) => (scheduler.cancel(id) ? "cancelled" : "not_running"),
+  };
   setTaskRuntime(runtime);
   return runtime;
 }

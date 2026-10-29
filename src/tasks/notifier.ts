@@ -22,6 +22,7 @@ export function createNotifier(opts: {
   let stopped = false;
   let running = false;
   let rerun = false;
+  let pausedUntil = 0;
   let timer: ReturnType<typeof setInterval> | null = null;
 
   // Returns false when the pass must stop (rate limited).
@@ -33,9 +34,10 @@ export function createNotifier(opts: {
       const lastError = err instanceof Error ? err.message : String(err);
       if (err instanceof TelegramApiError && err.code === 429) {
         const wait = err.retryAfter !== undefined ? err.retryAfter * 1000 : backoffMs(row.attempts + 1);
+        pausedUntil = now() + wait;
         store.markFailed(row.id, {
           attempts: row.attempts,
-          nextAttemptAt: now() + wait,
+          nextAttemptAt: pausedUntil,
           lastError,
           dead: false,
         });
@@ -65,9 +67,10 @@ export function createNotifier(opts: {
     try {
       do {
         rerun = false;
+        if (now() < pausedUntil) return;
         for (const row of store.pendingOutbox(now())) {
           if (stopped) return;
-          if (!(await deliver(row))) break;
+          if (!(await deliver(row))) return;
         }
       } while (rerun && !stopped);
     } finally {

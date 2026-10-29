@@ -164,6 +164,30 @@ describe("notifier", () => {
     expect(b.lastError).toBeNull();
   });
 
+  test("wake during 429 wait causes no extra send (SC-11)", async () => {
+    addOutbox();
+    addOutbox();
+    let n = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const nt = make(async () => {
+      n++;
+      if (n === 1) {
+        await gate;
+        throw new TelegramApiError("sendMessage", 429, "Too Many Requests", 1);
+      }
+    }, { tickMs: 50 });
+    nt.start();
+    await waitFor(() => n === 1);
+    nt.wake();
+    nt.wake();
+    release();
+    await new Promise((r) => setTimeout(r, 900));
+    expect(n).toBe(1);
+    await waitFor(() => rows().every((r) => r.state === "sent"), 3000);
+    expect(n).toBe(3);
+  });
+
   test("429 does not count toward dead", async () => {
     addOutbox();
     let n = 0;

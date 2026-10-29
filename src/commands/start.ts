@@ -432,7 +432,7 @@ export async function start(args: string[] = []) {
         getMaxWorkers: () => currentSettings.tasks.maxWorkers,
         send: async (chatId, text, threadId) => {
           const { sendMessage } = await import("./telegram");
-          await sendMessage(currentSettings.telegram.token, chatId, text, threadId);
+          await sendMessage(currentSettings.telegram.token, chatId, text, threadId, { retryOn429: false });
         },
       });
       console.log(`[${ts()}] Tasks: enabled (maxWorkers ${currentSettings.tasks.maxWorkers})`);

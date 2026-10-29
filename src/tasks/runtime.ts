@@ -7,6 +7,7 @@ export interface TaskRuntime {
   scheduler: Scheduler;
   notifier: Notifier;
   getMaxWorkers: () => number;
+  cancel(id: string): "cancelled" | "not_running";
 }
 
 let current: TaskRuntime | null = null;

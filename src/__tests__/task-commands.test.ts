@@ -14,6 +14,8 @@ import {
 let dir: string;
 let store: TaskStore;
 let wakes: number;
+let cancels: string[];
+let cancelResult: "cancelled" | "not_running";
 let runtime: TaskRuntime;
 let clock: number;
 const ctx = { chatId: 42, threadId: 7, userId: 99 };
@@ -24,11 +26,17 @@ beforeEach(() => {
   clock = 1_000_000;
   store = openTaskStore(join(dir, "tasks.db"), { now: () => clock });
   wakes = 0;
+  cancels = [];
+  cancelResult = "cancelled";
   runtime = {
     store,
-    scheduler: { start() {}, stop() {}, wake: () => void wakes++ },
+    scheduler: { start() {}, stop() {}, wake: () => void wakes++, cancel: () => false },
     notifier: { start() {}, stop() {}, wake() {} } as unknown as TaskRuntime["notifier"],
     getMaxWorkers: () => 5,
+    cancel: (id) => {
+      cancels.push(id);
+      return cancelResult;
+    },
   };
 });
 
@@ -81,7 +89,7 @@ describe("/tasks", () => {
   test("lists newest first, truncated, newlines flattened, max 10", () => {
     for (let i = 0; i < 12; i++) {
       clock += 1000;
-      store.create({ prompt: i === 11 ? `${"a".repeat(30)}\n${"b".repeat(30)}` : `p${i}`, chatId: 1 });
+      store.create({ prompt: i === 11 ? `${"a".repeat(30)}\n${"b".repeat(30)}` : `p${i}`, chatId: 42 });
     }
     const lines = reply("/tasks", "/tasks", runtime, clock + 3000)!.split("\n");
     expect(lines).toHaveLength(10);
@@ -93,7 +101,7 @@ describe("/tasks", () => {
 
 describe("/status", () => {
   test("shows task fields, omits empty ones, case-insensitive id", () => {
-    const task = store.create({ prompt: "do it", chatId: 1 });
+    const task = store.create({ prompt: "do it", chatId: 42 });
     const out = reply("/status", `/status ${task.id.toUpperCase()}`)!;
     const lines = out.split("\n");
     expect(lines[0]).toBe(`Task ${task.id}`);
@@ -113,22 +121,28 @@ describe("/status", () => {
 
 describe("/cancel", () => {
   test("queued is cancelled", () => {
-    const task = store.create({ prompt: "x", chatId: 1 });
+    const task = store.create({ prompt: "x", chatId: 42 });
     expect(reply("/cancel", `/cancel ${task.id}`)).toBe(`Cancelled task ${task.id}.`);
     expect(store.get(task.id)!.status).toBe("cancelled");
   });
 
-  test("running is refused", () => {
-    const task = store.create({ prompt: "x", chatId: 1 });
+  test("running is cancelled", () => {
+    const task = store.create({ prompt: "x", chatId: 42 });
     store.claim(5);
-    expect(reply("/cancel", `/cancel ${task.id}`)).toBe(
-      `Task ${task.id} is running; cancelling a running task is not supported yet.`
-    );
-    expect(store.get(task.id)!.status).toBe("running");
+    expect(reply("/cancel", `/cancel ${task.id}`)).toBe(`Cancelling task ${task.id}.`);
+    expect(cancels).toEqual([task.id]);
+  });
+
+  test("running but not_running reports status", () => {
+    const task = store.create({ prompt: "x", chatId: 42 });
+    store.claim(5);
+    cancelResult = "not_running";
+    expect(reply("/cancel", `/cancel ${task.id}`)).toBe(`Task ${task.id} is already running.`);
+    expect(cancels).toEqual([task.id]);
   });
 
   test("finished reports status", () => {
-    const task = store.create({ prompt: "x", chatId: 1 });
+    const task = store.create({ prompt: "x", chatId: 42 });
     store.claim(5);
     store.transition(task.id, ["running"], "completed", { exitCode: 0 });
     expect(reply("/cancel", `/cancel ${task.id}`)).toBe(`Task ${task.id} is already completed.`);
@@ -137,6 +151,21 @@ describe("/cancel", () => {
   test("not found and usage", () => {
     expect(reply("/cancel", "/cancel t-none")).toBe("Task t-none not found.");
     expect(reply("/cancel", "/cancel")).toBe("Usage: /cancel <id>");
+  });
+});
+
+describe("chat scoping (SC-10)", () => {
+  test("other chat's task is invisible", () => {
+    const mine = store.create({ prompt: "mine", chatId: 1 });
+    const theirs = store.create({ prompt: "theirs", chatId: 2 });
+    const c1 = { chatId: 1 };
+    const list = taskCommandReply("/tasks", "/tasks", c1, runtime, clock)!;
+    expect(list).toContain(mine.id);
+    expect(list).not.toContain(theirs.id);
+    expect(taskCommandReply("/status", `/status ${theirs.id}`, c1, runtime)).toBe(`Task ${theirs.id} not found.`);
+    expect(taskCommandReply("/cancel", `/cancel ${theirs.id}`, c1, runtime)).toBe(`Task ${theirs.id} not found.`);
+    expect(store.get(theirs.id)!.status).toBe("queued");
+    expect(cancels).toEqual([]);
   });
 });
 

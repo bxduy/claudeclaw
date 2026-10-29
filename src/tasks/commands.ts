@@ -65,13 +65,13 @@ export function taskCommandReply(
     return `Queued task ${task.id} (running ${store.countRunning()}/${runtime.getMaxWorkers()}).`;
   }
 
-  if (command === "/tasks") return formatTaskList(store.list(LIST_LIMIT), now);
+  if (command === "/tasks") return formatTaskList(store.list(LIST_LIMIT, ctx.chatId), now);
 
   if (command === "/cancel" && !arg) return "Usage: /cancel <id>";
 
   const id = arg.toLowerCase();
   const task = store.get(id);
-  if (!task) return `Task ${id} not found.`;
+  if (!task || task.chatId !== ctx.chatId) return `Task ${id} not found.`;
 
   if (command === "/status") return formatTaskStatus(task);
 
@@ -80,8 +80,8 @@ export function taskCommandReply(
   }
   // Re-read: the task may have been claimed between get and transition.
   const current = store.get(id)!;
-  if (current.status === "running") {
-    return `Task ${id} is running; cancelling a running task is not supported yet.`;
+  if (current.status === "running" && runtime.cancel(id) === "cancelled") {
+    return `Cancelling task ${id}.`;
   }
   return `Task ${id} is already ${current.status}.`;
 }

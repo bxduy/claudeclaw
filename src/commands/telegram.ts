@@ -453,13 +453,21 @@ async function callWithRetryAfter<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-async function sendMessage(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
+async function sendMessage(
+  token: string,
+  chatId: number,
+  text: string,
+  threadId?: number,
+  opts?: { retryOn429?: boolean }
+): Promise<void> {
+  const withRetry: typeof callWithRetryAfter =
+    opts?.retryOn429 === false ? (fn) => fn() : callWithRetryAfter;
   const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
   const html = markdownToTelegramHtml(normalized);
   const MAX_LEN = 4096;
   for (let i = 0; i < html.length; i += MAX_LEN) {
     try {
-      await callWithRetryAfter(() =>
+      await withRetry(() =>
         callApi(token, "sendMessage", {
           chat_id: chatId,
           text: html.slice(i, i + MAX_LEN),
@@ -470,7 +478,7 @@ async function sendMessage(token: string, chatId: number, text: string, threadId
     } catch (err) {
       if (err instanceof TelegramApiError && err.code === 429) throw err;
       // Fallback to plain text if HTML parsing fails
-      await callWithRetryAfter(() =>
+      await withRetry(() =>
         callApi(token, "sendMessage", {
           chat_id: chatId,
           text: normalized.slice(i, i + MAX_LEN),

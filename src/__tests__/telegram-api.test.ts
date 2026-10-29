@@ -67,6 +67,22 @@ describe("sendMessage", () => {
     expect(calls.length).toBe(1);
   });
 
+  test("retryOn429 false throws after one request", async () => {
+    const calls = mockFetch([tooMany(1), ok]);
+    const err = await sendMessage("t", 1, "hello", undefined, { retryOn429: false }).catch((e) => e);
+    expect(err).toBeInstanceOf(TelegramApiError);
+    expect(err.code).toBe(429);
+    expect(calls.length).toBe(1);
+  });
+
+  test("retryOn429 false also applies to plain fallback", async () => {
+    const calls = mockFetch([badRequest, tooMany(1), ok]);
+    const err = await sendMessage("t", 1, "hello", undefined, { retryOn429: false }).catch((e) => e);
+    expect(err).toBeInstanceOf(TelegramApiError);
+    expect(err.code).toBe(429);
+    expect(calls.length).toBe(2);
+  });
+
   test("keeps plain fallback on 400", async () => {
     const calls = mockFetch([badRequest, ok]);
     await sendMessage("t", 1, "hello");
