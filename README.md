@@ -87,6 +87,18 @@ Prior to this release, an empty `allowedUserIds` list meant **allow everyone**. 
 
 Run `claudeclaw config` for guided setup if you're unsure of your user ID.
 
+### Telegram settings
+
+| Key | Default | Meaning |
+|---|---|---|
+| `timeouts.telegram` | `5` | Minutes allowed for a single Telegram chat turn. |
+| `telegram.busyMode` | `"reject"` | When the chat's session is busy: `"reject"` replies that Claude is busy, `"queue"` tells the user the message is queued and answers it after the current reply. |
+| `telegram.dmIsolation` | `"shared"` | `"shared"` keeps all DMs in one session; `"perUser"` gives each DM user their own session that runs in parallel with the heartbeat. |
+
+With `"shared"`, DMs use the same queue as the heartbeat and pending-resume, so a DM may still have to wait or be rejected.
+
+The env var `CLAUDECLAW_TELEGRAM_API_BASE` overrides the Telegram API base URL (default `https://api.telegram.org/bot`); it exists for tests.
+
 ### v1.1.0 — Web UI bearer token gate
 
 All `/api/*` routes (except `/api/health`) now require an `Authorization: Bearer <token>` header. The token is auto-generated on first start and written to `.claude/claudeclaw/web.token`. The daemon also prints the full URL with the token embedded when the web UI starts.

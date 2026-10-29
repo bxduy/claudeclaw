@@ -1,9 +1,9 @@
-import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isSessionBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
 import { wrapUntrusted } from "../prompt-safety";
 import { isAllowed } from "../allowlist";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
-import { getSettings, loadSettings } from "../config";
+import { getSettings, loadSettings, type BusyMode } from "../config";
 import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
@@ -76,7 +76,7 @@ function markdownToTelegramHtml(text: string): string {
 
 // --- Telegram Bot API (raw fetch, zero deps) ---
 
-const API_BASE = "https://api.telegram.org/bot";
+const API_BASE = process.env.CLAUDECLAW_TELEGRAM_API_BASE?.trim() || "https://api.telegram.org/bot";
 const FILE_API_BASE = "https://api.telegram.org/file/bot";
 
 interface TelegramUser {
@@ -252,6 +252,13 @@ function getMessageTextAndEntities(message: TelegramMessage): {
   return { text: "", entities: [] };
 }
 
+const QUEUED_TEXT = "Queued — I'll answer after the current reply in this chat finishes.";
+
+export function decideBusyAction(mode: BusyMode, busy: boolean): "run" | "reject" | "queue" {
+  if (!busy) return "run";
+  return mode === "queue" ? "queue" : "reject";
+}
+
 export function isImageDocument(document?: TelegramDocument): boolean {
   return Boolean(document?.mime_type?.startsWith("image/"));
 }
@@ -381,7 +388,19 @@ function extractTelegramCommand(text: string): string | null {
   return firstToken.split("@", 1)[0].toLowerCase();
 }
 
-async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
+export class TelegramApiError extends Error {
+  constructor(
+    readonly method: string,
+    readonly code: number,
+    readonly description: string,
+    readonly retryAfter?: number
+  ) {
+    super(`Telegram API ${method}: ${code} ${description}`);
+    this.name = "TelegramApiError";
+  }
+}
+
+export async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
   // Add 15s buffer on top of Telegram's own long-poll timeout (default 30s)
   const telegramTimeout = (body?.timeout as number | undefined) ?? 0;
   const httpTimeout = Math.max(30_000, (telegramTimeout + 15) * 1000);
@@ -392,9 +411,44 @@ async function callApi<T>(token: string, method: string, body?: Record<string, u
     signal: AbortSignal.timeout(httpTimeout),
   });
   if (!res.ok) {
-    throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}`);
+    const errBody = (await res.json().catch(() => null)) as {
+      error_code?: number;
+      description?: string;
+      parameters?: { retry_after?: unknown };
+    } | null;
+    const retryAfter = errBody?.parameters?.retry_after;
+    throw new TelegramApiError(
+      method,
+      errBody?.error_code ?? res.status,
+      errBody?.description ?? res.statusText,
+      typeof retryAfter === "number" ? retryAfter : undefined
+    );
   }
   return (await res.json()) as T;
+}
+
+const MAX_SEND_ATTEMPTS = 3;
+const MAX_RETRY_AFTER_SECONDS = 60;
+
+// Retry a send on Telegram 429 when retry_after is short; rethrow anything else.
+async function callWithRetryAfter<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (
+        err instanceof TelegramApiError &&
+        err.code === 429 &&
+        err.retryAfter !== undefined &&
+        err.retryAfter <= MAX_RETRY_AFTER_SECONDS &&
+        attempt < MAX_SEND_ATTEMPTS
+      ) {
+        await Bun.sleep(err.retryAfter * 1000);
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 async function sendMessage(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
@@ -403,19 +457,24 @@ async function sendMessage(token: string, chatId: number, text: string, threadId
   const MAX_LEN = 4096;
   for (let i = 0; i < html.length; i += MAX_LEN) {
     try {
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: html.slice(i, i + MAX_LEN),
-        parse_mode: "HTML",
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    } catch {
+      await callWithRetryAfter(() =>
+        callApi(token, "sendMessage", {
+          chat_id: chatId,
+          text: html.slice(i, i + MAX_LEN),
+          parse_mode: "HTML",
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        })
+      );
+    } catch (err) {
+      if (err instanceof TelegramApiError && err.code === 429) throw err;
       // Fallback to plain text if HTML parsing fails
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: normalized.slice(i, i + MAX_LEN),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
+      await callWithRetryAfter(() =>
+        callApi(token, "sendMessage", {
+          chat_id: chatId,
+          text: normalized.slice(i, i + MAX_LEN),
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        })
+      );
     }
   }
 }
@@ -749,21 +808,26 @@ async function sendMessageWithButtons(
     const isLast = i + MAX_LEN >= html.length;
     const replyMarkup = isLast ? { inline_keyboard } : undefined;
     try {
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: html.slice(i, i + MAX_LEN),
-        parse_mode: "HTML",
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    } catch {
+      await callWithRetryAfter(() =>
+        callApi(token, "sendMessage", {
+          chat_id: chatId,
+          text: html.slice(i, i + MAX_LEN),
+          parse_mode: "HTML",
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        })
+      );
+    } catch (err) {
+      if (err instanceof TelegramApiError && err.code === 429) throw err;
       // Fallback to plain text if HTML parse fails
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: normalized.slice(i, i + MAX_LEN),
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
+      await callWithRetryAfter(() =>
+        callApi(token, "sendMessage", {
+          chat_id: chatId,
+          text: normalized.slice(i, i + MAX_LEN),
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        })
+      );
     }
   }
 }
@@ -1455,18 +1519,23 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       );
     }
     const prefixedPrompt = promptParts.join("\n");
-    const busy = isMainBusy();
+    const action = decideBusyAction(config.busyMode, isSessionBusy(sessionKey));
     const verbose = verboseChats.has(chatId);
     const modelOverride = chatModels.get(chatId);
     let result;
     let streamMsgId: number | null = null;
     let hadToolLines = false;
-    if (busy) {
+    if (action === "reject") {
       await sendMessage(config.token, chatId, "Claude is busy — try again in a moment, or use /fork for a quick parallel task.", threadId);
       return;
     } else {
       const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
-      result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, modelOverride);
+      // No await between isSessionBusy and runUserMessage: enqueue bumps the counter synchronously.
+      const resultPromise = runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, modelOverride);
+      if (action === "queue") {
+        sendMessage(config.token, chatId, QUEUED_TEXT, threadId).catch(() => {});
+      }
+      result = await resultPromise;
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;
       hadToolLines = streamResult.hadToolLines;
@@ -1753,6 +1822,12 @@ let isPolling = false;
 // increments the counter, even if a long-poll request is still in flight.
 let pollingGeneration = 0;
 
+/** Jittered exponential backoff: cap = min(60s, 1s * 2^failures), result in [cap/2, cap]. */
+export function pollBackoffMs(failures: number, rand: () => number = Math.random): number {
+  const cap = Math.min(60_000, 1000 * 2 ** failures);
+  return cap / 2 + rand() * (cap / 2);
+}
+
 async function poll(generation: number): Promise<void> {
   const config = getSettings().telegram;
   let offset = 0;
@@ -1775,6 +1850,7 @@ async function poll(generation: number): Promise<void> {
   // Register available skills as bot command menu (non-blocking)
   registerBotCommands(config.token).catch(() => {});
 
+  let failures = 0;
   while (running && pollingGeneration === generation) {
     try {
       const data = await callApi<{ ok: boolean; result: TelegramUpdate[] }>(
@@ -1786,7 +1862,13 @@ async function poll(generation: number): Promise<void> {
       // Check generation after the in-flight long-poll request returns.
       if (pollingGeneration !== generation) break;
 
-      if (!data.ok || !data.result.length) continue;
+      if (!data.ok) {
+        failures++;
+        await Bun.sleep(pollBackoffMs(failures));
+        continue;
+      }
+      failures = 0;
+      if (!data.result.length) continue;
 
       for (const update of data.result) {
         debugLog(
@@ -1819,7 +1901,12 @@ async function poll(generation: number): Promise<void> {
       if (pollingGeneration !== generation) break;
       if (!running) break;
       console.error(`[Telegram] Poll error: ${err instanceof Error ? err.message : err}`);
-      await Bun.sleep(5000);
+      if (err instanceof TelegramApiError && err.code === 429 && err.retryAfter) {
+        await Bun.sleep(err.retryAfter * 1000);
+      } else {
+        failures++;
+        await Bun.sleep(pollBackoffMs(failures));
+      }
     }
   }
 
@@ -1865,7 +1952,8 @@ export function startPolling(debug = false): void {
   const gen = ++pollingGeneration;
   (async () => {
     await ensureProjectClaudeMd();
-    await runPendingResumeTelegram().catch((err) =>
+    // Resume errors stay isolated (commit 99358ba) but polling no longer waits for resume.
+    runPendingResumeTelegram().catch((err) =>
       console.error(`[Telegram] Pending resume failed: ${err instanceof Error ? err.message : err}`)
     );
     await poll(gen);
