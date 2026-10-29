@@ -5,6 +5,7 @@ import { join } from "path";
 import {
   appendEventLine,
   isRateLimited,
+  killTaskProcesses,
   runTaskClaude,
   TASK_DISALLOWED_TOOLS,
   TASK_SYSTEM_PROMPT,
@@ -13,6 +14,7 @@ import {
 
 let dir: string;
 let pidsFile: string;
+const spawnedPids: number[] = [];
 
 const SETTINGS = {
   security: { level: "unrestricted" as const, allowedTools: [], disallowedTools: [] },
@@ -66,7 +68,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const pid of [...readPids(pidsFile), ...readPids(join(dir, "child.pid")), ...readPids(join(dir, "setsid.pids"))]) {
+  for (const pid of [...readPids(pidsFile), ...readPids(join(dir, "child.pid")), ...readPids(join(dir, "setsid.pids")), ...spawnedPids.splice(0)]) {
     try { process.kill(-pid, "SIGKILL"); } catch {}
     try { process.kill(pid, "SIGKILL"); } catch {}
   }
@@ -118,28 +120,56 @@ describe("runTaskClaude", () => {
     expect(events[3]).toEqual({ type: "result", result: "done" });
   });
 
-  test("passes session id and task flags", async () => {
+  /** Fake claude that records its argv (NUL separated) and its stdin. */
+  function recordingClaude(): { exe: string; argsFile: string; stdinFile: string } {
     const argsFile = join(dir, "args");
-    const exe = fakeClaude(`printf '%s\\0' "$@" > "${argsFile}"`);
+    const stdinFile = join(dir, "stdin");
+    const exe = fakeClaude(`printf '%s\\0' "$@" > "${argsFile}"\ncat > "${stdinFile}"`);
+    return { exe, argsFile, stdinFile };
+  }
+  const readArgs = (file: string) => readFileSync(file, "utf8").split("\0").slice(0, -1);
+
+  test("passes session id and task flags", async () => {
+    const { exe, argsFile, stdinFile } = recordingClaude();
     const res = await runTaskClaude(opts(exe));
     expect(res.exitCode).toBe(0);
-    const args = readFileSync(argsFile, "utf8").split("\0").slice(0, -1);
-    expect(args.slice(0, 7)).toEqual([
+    const args = readArgs(argsFile);
+    expect(args.slice(0, 6)).toEqual([
       "-p",
-      "do the thing",
       "--output-format",
       "stream-json",
       "--verbose",
       "--session-id",
       "11111111-2222-3333-4444-555555555555",
     ]);
+    expect(args).not.toContain("do the thing");
+    expect(readFileSync(stdinFile, "utf8")).toBe("do the thing");
     const sp = args.indexOf("--append-system-prompt");
-    expect(sp).toBeGreaterThan(6);
+    expect(sp).toBeGreaterThan(5);
     expect(args[sp + 1]).toBe(TASK_SYSTEM_PROMPT);
     const disallowed = args.flatMap((a, i) => (a === "--disallowedTools" ? [args[i + 1]!] : []));
     expect(disallowed).toHaveLength(1);
     expect(disallowed[0]).toContain("Bash(gh pr merge:*)");
     expect(args).not.toContain("--model");
+  });
+
+  for (const prompt of ["--version", "- a\n- b", `--settings={"x":1}`]) {
+    test(`option-like prompt ${JSON.stringify(prompt)} goes to stdin, not argv`, async () => {
+      const { exe, argsFile, stdinFile } = recordingClaude();
+      const res = await runTaskClaude(opts(exe, { prompt }));
+      expect(res.exitCode).toBe(0);
+      expect(readFileSync(stdinFile, "utf8")).toBe(prompt);
+      const args = readArgs(argsFile);
+      expect(args).not.toContain(prompt);
+      expect(args.some((a) => a.startsWith("--settings") || a === "--version" || a === "-")).toBe(false);
+    });
+  }
+
+  test("tags the child with the task session env", async () => {
+    const envFile = join(dir, "env");
+    const exe = fakeClaude(`printf '%s' "$CLAUDECLAW_TASK_SESSION" > "${envFile}"`);
+    await runTaskClaude(opts(exe));
+    expect(readFileSync(envFile, "utf8")).toBe("11111111-2222-3333-4444-555555555555");
   });
 
   test("idle kills the whole group", async () => {
@@ -255,12 +285,119 @@ describe("runTaskClaude", () => {
     expect(res.exitCode).toBe(0);
   }, 15_000);
 
+  // Claude Code runs Bash-tool commands in their own session, out of reach of the group kill.
+  const SETSID_PIDS = () => join(dir, "setsid.pids");
+  const setsidSleeper = () => [
+    "setsid sleep 300 > /dev/null 2>&1 < /dev/null &",
+    `echo $! >> "${SETSID_PIDS()}"`,
+  ];
+  async function waitFor(pred: () => boolean, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (pred()) return true;
+      await Bun.sleep(10);
+    }
+    return pred();
+  }
+  /** Gone or a zombie waiting for its reaper: either way it no longer runs. */
+  function running(pid: number): boolean {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return !/^\d+ \(.*\) Z/.test(stat);
+    } catch {
+      return false;
+    }
+  }
+
+  const linuxOnly = process.platform === "linux" ? test : test.skip;
+
+  linuxOnly("sweeps tool processes in their own session after a clean exit", async () => {
+    // The pause lets the background child finish setsid() before the shell exits and the group is killed.
+    const exe = fakeClaude([...setsidSleeper(), `echo '{"type":"result","result":"done"}'`, "sleep 0.3", "exit 0"].join("\n"));
+    const res = await runTaskClaude(opts(exe));
+    expect(res.exitCode).toBe(0);
+    const [sleeper] = readPids(SETSID_PIDS());
+    expect(sleeper).toBeGreaterThan(0);
+    expect(await waitFor(() => !running(sleeper!), 200)).toBe(true);
+  }, 15_000);
+
+  linuxOnly("sweeps tool processes after an idle kill", async () => {
+    const exe = fakeClaude([...setsidSleeper(), `echo '{"type":"system","subtype":"init"}'`, "sleep 300"].join("\n"));
+    const res = await runTaskClaude(opts(exe, { idleTimeoutMs: 1000 }));
+    expect(res.reason).toBe("idle");
+    const [sleeper] = readPids(SETSID_PIDS());
+    expect(await waitFor(() => !running(sleeper!), 200)).toBe(true);
+  }, 15_000);
+
+  linuxOnly("sweeps tool processes on shutdown abort", async () => {
+    const exe = fakeClaude([...setsidSleeper(), `echo '{"type":"system","subtype":"init"}'`, "sleep 300"].join("\n"));
+    const ac = new AbortController();
+    let sleeperDeadAfterAbort: boolean | undefined;
+    setTimeout(() => {
+      ac.abort("shutdown");
+      // The daemon exits right after aborting: the sweep must already have run.
+      const [sleeper] = readPids(SETSID_PIDS());
+      sleeperDeadAfterAbort = sleeper !== undefined && waitForSync(() => !running(sleeper), 200);
+    }, 500);
+    const res = await runTaskClaude(opts(exe, { signal: ac.signal }));
+    expect(res.reason).toBe("cancelled");
+    expect(sleeperDeadAfterAbort).toBe(true);
+  }, 15_000);
+
+  function waitForSync(pred: () => boolean, ms: number): boolean {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (pred()) return true;
+      Bun.sleepSync(10);
+    }
+    return pred();
+  }
+
+  linuxOnly("killTaskProcesses kills every process carrying the session tag", async () => {
+    const tag = `test-${Math.random().toString(36).slice(2)}`;
+    const tagged = Bun.spawn(["sleep", "300"], { env: { ...process.env, CLAUDECLAW_TASK_SESSION: tag } });
+    const other = Bun.spawn(["sleep", "300"], { env: { ...process.env, CLAUDECLAW_TASK_SESSION: `${tag}-other` } });
+    spawnedPids.push(tagged.pid, other.pid);
+    await Bun.sleep(100);
+    expect(killTaskProcesses(tag)).toBe(1);
+    await tagged.exited;
+    expect(tagged.signalCode).toBe("SIGKILL");
+    expect(alive(other.pid)).toBe(true);
+    expect(killTaskProcesses(tag)).toBe(0);
+  });
+
+  test("result quoting the limit phrase on a clean exit is not a rate limit", async () => {
+    expect(isRateLimited()).toBe(false);
+    const exe = fakeClaude([
+      "cat <<'EOF'",
+      `{"type":"result","is_error":false,"result":"The docs say: You've hit your limit · resets 3pm (UTC)"}`,
+      "EOF",
+      "exit 0",
+    ].join("\n"));
+    const res = await runTaskClaude(opts(exe));
+    expect(res.exitCode).toBe(0);
+    expect(res.reason).toBeUndefined();
+    expect(isRateLimited()).toBe(false);
+  });
+
+  test("is_error result with the limit phrase is a rate limit", async () => {
+    const exe = fakeClaude([
+      "cat <<'EOF'",
+      `{"type":"result","is_error":true,"result":"You've hit your limit · resets 3pm (UTC)"}`,
+      "EOF",
+      "exit 0",
+    ].join("\n"));
+    const res = await runTaskClaude(opts(exe));
+    expect(res.reason).toBe("rate_limit");
+  });
+
   // Keep last: rate-limit state is a module-level global that cannot be reset.
   test("rate limit", async () => {
     const exe = fakeClaude([
       "cat <<'EOF'",
       `{"type":"result","result":"You've hit your limit · resets 3pm (UTC)"}`,
       "EOF",
+      "exit 1",
     ].join("\n"));
     const res = await runTaskClaude(opts(exe));
     expect(res.reason).toBe("rate_limit");

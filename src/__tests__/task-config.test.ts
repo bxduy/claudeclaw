@@ -46,4 +46,15 @@ describe("parseTasksSettings", () => {
     expect(parseTasksSettings({ progressIntervalSec: "30" }).progressIntervalSec).toBe(30);
     expect(parseTasksSettings({ idleTimeoutMinutes: Infinity }).idleTimeoutMinutes).toBe(20);
   });
+
+  test("clamps huge values so setTimeout cannot overflow", () => {
+    const t = parseTasksSettings({ timeoutMinutes: 100000, idleTimeoutMinutes: 100000, progressIntervalSec: 999999 });
+    expect(t.timeoutMinutes).toBe(1440);
+    expect(t.idleTimeoutMinutes).toBe(1440);
+    expect(t.progressIntervalSec).toBe(3600);
+  });
+
+  test("clamps a tiny progress interval up to 1 second", () => {
+    expect(parseTasksSettings({ progressIntervalSec: 0.2 }).progressIntervalSec).toBe(1);
+  });
 });

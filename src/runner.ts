@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile, realpath } from "fs/promises";
 import { join, dirname, resolve, sep } from "path";
 import { execSync } from "child_process";
-import { appendFileSync, existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
+import { appendFileSync, existsSync, writeFileSync, mkdirSync, readFileSync, readdirSync } from "fs";
 import {
   getSession,
   createSession,
@@ -674,6 +674,39 @@ function signalGroup(pgid: number, sig: "SIGTERM" | "SIGKILL"): void {
   }
 }
 
+/** Env var that tags every process of one task run (claude and everything it spawns inherits it). */
+const TASK_SESSION_ENV = "CLAUDECLAW_TASK_SESSION";
+
+/**
+ * SIGKILL every process tagged with this task's session id. Claude Code runs Bash-tool
+ * commands in their own session, so the process-group kill does not reach them.
+ * Synchronous on purpose: shutdown calls it right before process.exit.
+ * Linux only (reads /proc/<pid>/environ); other platforms rely on the group kill alone.
+ */
+export function killTaskProcesses(sessionId: string): number {
+  if (process.platform !== "linux") return 0;
+  const entry = `${TASK_SESSION_ENV}=${sessionId}`;
+  let pids: string[];
+  try {
+    pids = readdirSync("/proc").filter((p) => /^\d+$/.test(p));
+  } catch {
+    return 0;
+  }
+  let killed = 0;
+  for (const p of pids) {
+    const pid = Number(p);
+    if (pid === process.pid) continue;
+    try {
+      if (!readFileSync(`/proc/${p}/environ`, "utf8").split("\0").includes(entry)) continue;
+      process.kill(pid, "SIGKILL");
+      killed++;
+    } catch {
+      // Vanished, unreadable (another user's process) or already gone: nothing to kill.
+    }
+  }
+  return killed;
+}
+
 /** Wait (bounded) until no process is left in the group; killed members may linger briefly before reaping. */
 async function waitForGroupExit(pgid: number, maxMs: number): Promise<void> {
   const deadline = Date.now() + maxMs;
@@ -702,9 +735,10 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
   const systemPrompt = security.level !== "unrestricted"
     ? `${TASK_SYSTEM_PROMPT}\n\n${DIR_SCOPE_PROMPT}`
     : TASK_SYSTEM_PROMPT;
+  // The prompt goes on stdin, never in argv: a prompt starting with "-" would be parsed as a CLI option.
   const args = [
     opts.executable ?? CLAUDE_EXECUTABLE,
-    "-p", opts.prompt,
+    "-p",
     "--output-format", "stream-json",
     "--verbose",
     "--session-id", opts.sessionId,
@@ -717,12 +751,18 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
   // detached: the child leads a new process group (pgid === pid), so -pid reaches its descendants.
   const proc = Bun.spawn(args, {
     cwd: opts.cwd,
+    stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
-    env: buildChildEnv(cleanSpawnEnv(), model, api),
+    env: { ...buildChildEnv(cleanSpawnEnv(), model, api), [TASK_SESSION_ENV]: opts.sessionId },
     detached: true,
   });
   const pgid = proc.pid;
+  // A child that exits without reading stdin makes the write fail; the run outcome covers that.
+  try {
+    proc.stdin.write(opts.prompt);
+    Promise.resolve(proc.stdin.end()).catch(() => {});
+  } catch {}
 
   let reason: TaskRunResult["reason"];
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -743,8 +783,16 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => stop("idle"), opts.idleTimeoutMs);
   };
-  // Shutdown exits the daemon right after aborting, so there is no time for a SIGTERM grace period.
-  const onAbort = () => stop("cancelled", opts.signal?.reason === "shutdown" ? "SIGKILL" : "SIGTERM");
+  // Shutdown exits the daemon right after aborting, so there is no time for a SIGTERM grace period
+  // and the session sweep has to happen here, synchronously.
+  const onAbort = () => {
+    if (opts.signal?.reason === "shutdown") {
+      stop("cancelled", "SIGKILL");
+      killTaskProcesses(opts.sessionId);
+    } else {
+      stop("cancelled");
+    }
+  };
 
   const totalTimer = setTimeout(() => stop("timeout"), opts.timeoutMs);
   armIdle();
@@ -752,6 +800,7 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
   if (opts.signal?.aborted) onAbort();
 
   let result = "";
+  let resultIsError = false;
   const written = { bytes: 0 };
   let eventLogFailed = false;
   const handleLine = (line: string) => {
@@ -774,7 +823,10 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
     }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
     const event = parsed as Record<string, unknown>;
-    if (event.type === "result" && typeof event.result === "string") result = event.result;
+    if (event.type === "result") {
+      if (typeof event.result === "string") result = event.result;
+      resultIsError = event.is_error === true;
+    }
     try {
       opts.onEvent?.(event);
     } catch (err) {
@@ -822,8 +874,9 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
   try {
     exitCode = await proc.exited;
     disarm();
-    // Kill anything claude left behind in its group; this also closes pipes they hold.
+    // Kill anything claude left behind in its group or in sessions of its own; this also closes pipes they hold.
     signalGroup(pgid, "SIGKILL");
+    killTaskProcesses(opts.sessionId);
     const expired = new Promise<"expired">((resolve) => {
       drainTimer = setTimeout(() => resolve("expired"), TASK_DRAIN_MS);
     });
@@ -839,7 +892,8 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
   }
   stderr = stderr.trim();
 
-  if (!reason) {
+  // A successful run may quote the limit phrase; only a failed run counts as rate limited.
+  if (!reason && (exitCode !== 0 || resultIsError)) {
     const rateLimitMessage = extractRateLimitMessage(result, stderr);
     if (rateLimitMessage) {
       reason = "rate_limit";

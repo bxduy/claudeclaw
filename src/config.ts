@@ -135,9 +135,10 @@ export function parseTasksSettings(raw: unknown): TasksConfig {
   return {
     enabled: r.enabled === true,
     maxWorkers: Number.isFinite(mw) && mw > 0 ? mw : 5,
-    timeoutMinutes: positiveNumber(r.timeoutMinutes, 120),
-    idleTimeoutMinutes: positiveNumber(r.idleTimeoutMinutes, 20),
-    progressIntervalSec: positiveNumber(r.progressIntervalSec, 30),
+    // Clamped so the derived setTimeout delay stays far below its 2^31 ms overflow.
+    timeoutMinutes: Math.min(positiveNumber(r.timeoutMinutes, 120), 1440),
+    idleTimeoutMinutes: Math.min(positiveNumber(r.idleTimeoutMinutes, 20), 1440),
+    progressIntervalSec: Math.min(Math.max(positiveNumber(r.progressIntervalSec, 30), 1), 3600),
   };
 }
 
