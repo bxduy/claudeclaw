@@ -92,7 +92,7 @@ describe("status cards", () => {
     await sleep(5);
     cards.progress(task, "● Read a");
     await sleep(130);
-    expect(f.edits.length).toBeLessThanOrEqual(1);
+    expect(f.edits.length).toBe(1);
     cards.finished({ ...task, status: "completed" });
   });
 
@@ -170,5 +170,52 @@ describe("status cards", () => {
     expect(second).toBe(("ab cd " + "x".repeat(200)).slice(0, 80));
     expect(second.length).toBe(80);
     cards.finished({ ...task, status: "completed" });
+  });
+
+  // Fake with latency; "applied" records the order requests complete (what Telegram would apply).
+  function slowApi(sendMs: number, editMs: number) {
+    const applied: string[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const api: CardApi = {
+      async send() {
+        await sleep(sendMs);
+        return 5;
+      },
+      async edit(_c, _m, text) {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await sleep(editMs);
+        inFlight--;
+        applied.push(text);
+      },
+    };
+    return { api, applied, maxInFlight: () => maxInFlight };
+  }
+
+  test("finished during a slow edit: final text is applied last, edits never overlap", async () => {
+    const s = slowApi(0, 80);
+    const cards = createStatusCards({ api: s.api, getIntervalMs: () => 20 });
+    const task = mkTask();
+    cards.started(task);
+    await sleep(5);
+    cards.progress(task, "● Read a");
+    await sleep(40); // tick fired, running edit is in flight
+    cards.finished({ ...task, status: "completed" });
+    await sleep(250);
+    expect(s.applied[s.applied.length - 1].startsWith("✅ Task t1 completed ·")).toBe(true);
+    expect(s.maxInFlight()).toBe(1);
+  });
+
+  test("finished during a slow send with a tick pending: final text is applied last", async () => {
+    const s = slowApi(80, 10);
+    const cards = createStatusCards({ api: s.api, getIntervalMs: () => 20 });
+    const task = mkTask();
+    cards.started(task);
+    cards.progress(task, "● Read a");
+    await sleep(40); // tick fired while send is still pending
+    cards.finished({ ...task, status: "failed" });
+    await sleep(250);
+    expect(s.applied[s.applied.length - 1].startsWith("❌ Task t1 failed ·")).toBe(true);
   });
 });

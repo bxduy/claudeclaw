@@ -35,16 +35,19 @@ export function createStatusCards(opts: {
     return `⏳ Task ${id} running · ${formatAge(now() - card.startedAt)}\n${card.latestLine ?? card.prompt}`;
   }
 
-  async function edit(card: Card, text: string, final = false): Promise<void> {
-    await card.sent;
-    if (card.done && !final) return;
-    if (card.messageId === null || text === card.lastText) return;
-    card.lastText = text;
-    try {
-      await api.edit(card.chatId, card.messageId, text);
-    } catch (err) {
-      console.error("[tasks] card edit failed:", err);
-    }
+  /** Edits are chained on card.sent so they never overlap and the final one always runs last. */
+  function edit(card: Card, text: string, final = false): Promise<void> {
+    card.sent = card.sent.then(async () => {
+      if (card.done && !final) return;
+      if (card.messageId === null || text === card.lastText) return;
+      card.lastText = text;
+      try {
+        await api.edit(card.chatId, card.messageId, text);
+      } catch (err) {
+        console.error("[tasks] card edit failed:", err);
+      }
+    });
+    return card.sent;
   }
 
   function schedule(id: string, card: Card): void {
