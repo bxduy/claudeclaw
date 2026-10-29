@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { openTaskStore, type Task, type TaskStore } from "../tasks/store";
-import { createScheduler, noExecutor, type Scheduler, type TaskExecutor } from "../tasks/scheduler";
+import { createScheduler, noExecutor, type Scheduler, type TaskExecutor, type TaskObserver } from "../tasks/scheduler";
 
 let dir: string;
 let dbPath: string;
@@ -19,7 +19,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
   }
 }
 
-function make(executor: TaskExecutor, extra: { max?: number; onOutbox?: () => void; tickMs?: number } = {}): Scheduler {
+function make(executor: TaskExecutor, extra: { max?: number; onOutbox?: () => void; tickMs?: number; isPaused?: () => boolean; observer?: TaskObserver } = {}): Scheduler {
   scheduler = createScheduler({
     store,
     executor,
@@ -27,6 +27,8 @@ function make(executor: TaskExecutor, extra: { max?: number; onOutbox?: () => vo
     tasksDir,
     onOutbox: extra.onOutbox,
     tickMs: extra.tickMs ?? 60_000,
+    isPaused: extra.isPaused,
+    observer: extra.observer,
   });
   return scheduler;
 }
@@ -182,5 +184,151 @@ describe("scheduler", () => {
     s.wake();
     await new Promise((r) => setTimeout(r, 100));
     expect(store.get(t.id)!.status).toBe("queued");
+  });
+
+  test("paused scheduler claims nothing", async () => {
+    let paused = true;
+    let calls = 0;
+    const s = make(async () => (calls++, { exitCode: 0 }), { isPaused: () => paused });
+    const t = add();
+    s.start();
+    s.wake();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(store.get(t.id)!.status).toBe("queued");
+    expect(calls).toBe(0);
+    paused = false;
+    s.wake();
+    await waitFor(() => store.get(t.id)?.status === "completed");
+  });
+
+  const outbox = () => store.pendingOutbox(Date.now() + 1e9).map((r) => r.text);
+
+  test("outcome mapping", async () => {
+    const outcomes = [
+      { exitCode: 0, summary: "ok" },
+      { exitCode: 1, failureReason: "idle" },
+      { exitCode: 3 },
+      { exitCode: 0, failureReason: "timeout" },
+    ];
+    let i = 0;
+    const s = make(async () => outcomes[i++]);
+    const ids: string[] = [];
+    for (let k = 0; k < 4; k++) ids.push(add().id);
+    s.start();
+    await waitFor(() => ids.every((id) => ["completed", "failed"].includes(store.get(id)!.status)));
+    const [a, b, c, d] = ids.map((id) => store.get(id)!);
+    expect(a.status).toBe("completed");
+    expect(outbox()).toContain(`✅ Task ${a.id} completed.\n\nok`);
+    expect([b.status, b.failureReason]).toEqual(["failed", "idle"]);
+    expect([c.status, c.failureReason, c.exitCode]).toEqual(["failed", "exit", 3]);
+    expect([d.status, d.failureReason]).toEqual(["failed", "timeout"]);
+  });
+
+  test("cancel aborts running executor", async () => {
+    let started = false;
+    const finished: Task[] = [];
+    const s = make(
+      async (_t, ctx) => {
+        started = true;
+        await new Promise<void>((r) => ctx.signal.addEventListener("abort", () => r()));
+        return { exitCode: 143, failureReason: "cancelled" };
+      },
+      { observer: { started() {}, progress() {}, finished: (t) => void finished.push(t) } }
+    );
+    const t = add();
+    s.start();
+    await waitFor(() => started);
+    store.transition(t.id, ["running"], "cancelled");
+    expect(s.cancel(t.id)).toBe(true);
+    await waitFor(() => finished.length > 0);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(store.get(t.id)!.status).toBe("cancelled");
+    expect(outbox().filter((x) => x.includes("🚫")).length).toBe(1);
+    expect(outbox().length).toBe(1);
+    expect(finished.length).toBe(1);
+    expect(finished[0].status).toBe("cancelled");
+    expect(s.cancel("t-none")).toBe(false);
+  });
+
+  test("cancel races completion", async () => {
+    const finished: Task[] = [];
+    const s = make(async () => ({ exitCode: 0 }), {
+      observer: { started() {}, progress() {}, finished: (t) => void finished.push(t) },
+    });
+    const t = add();
+    s.start();
+    await waitFor(() => finished.length > 0);
+    store.transition(t.id, ["running"], "cancelled");
+    s.cancel(t.id);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(["completed", "cancelled"]).toContain(store.get(t.id)!.status);
+    expect(outbox().length).toBe(1);
+    expect(finished.length).toBe(1);
+  });
+
+  test("setSessionId via ctx", async () => {
+    const s = make(async (_t, ctx) => (ctx.setSessionId("u-1"), { exitCode: 0 }));
+    const t = add();
+    s.start();
+    await waitFor(() => store.get(t.id)?.status === "completed");
+    expect(store.get(t.id)!.sessionId).toBe("u-1");
+  });
+
+  test("observer order and error isolation", async () => {
+    const events: string[] = [];
+    const s = make(
+      async (_t, ctx) => {
+        events.push("exec");
+        ctx.onProgress("line-1");
+        return { exitCode: 0 };
+      },
+      {
+        observer: {
+          started() {
+            events.push("started");
+            throw new Error("observer boom");
+          },
+          progress: (_t, line) => void events.push(`progress:${line}`),
+          finished: (t) => {
+            events.push(`finished:${t.status}`);
+            throw new Error("observer boom 2");
+          },
+        },
+      }
+    );
+    const realConsoleError = console.error;
+    console.error = () => {};
+    try {
+      const t = add();
+      s.start();
+      await waitFor(() => events.includes("finished:completed"));
+      expect(events).toEqual(["started", "exec", "progress:line-1", "finished:completed"]);
+      expect(store.get(t.id)!.status).toBe("completed");
+    } finally {
+      console.error = realConsoleError;
+    }
+  });
+
+  test("stop aborts with shutdown reason", async () => {
+    let reason: unknown = null;
+    let started = false;
+    let finishedCalls = 0;
+    const s = make(
+      async (_t, ctx) => {
+        started = true;
+        ctx.signal.addEventListener("abort", () => (reason = ctx.signal.reason));
+        await new Promise<void>((r) => ctx.signal.addEventListener("abort", () => r()));
+        return { exitCode: 137, failureReason: "cancelled" };
+      },
+      { observer: { started() {}, progress() {}, finished: () => void finishedCalls++ } }
+    );
+    const t = add();
+    s.start();
+    await waitFor(() => started);
+    s.stop();
+    expect(reason).toBe("shutdown");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(store.get(t.id)!.status).toBe("running");
+    expect(finishedCalls).toBe(0);
   });
 });
