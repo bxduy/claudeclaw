@@ -1,9 +1,9 @@
-import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isSessionBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
 import { wrapUntrusted } from "../prompt-safety";
 import { isAllowed } from "../allowlist";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
-import { getSettings, loadSettings } from "../config";
+import { getSettings, loadSettings, type BusyMode } from "../config";
 import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
@@ -250,6 +250,13 @@ function getMessageTextAndEntities(message: TelegramMessage): {
   }
 
   return { text: "", entities: [] };
+}
+
+const QUEUED_TEXT = "Queued — I'll answer after the current reply in this chat finishes.";
+
+export function decideBusyAction(mode: BusyMode, busy: boolean): "run" | "reject" | "queue" {
+  if (!busy) return "run";
+  return mode === "queue" ? "queue" : "reject";
 }
 
 export function isImageDocument(document?: TelegramDocument): boolean {
@@ -1455,18 +1462,23 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       );
     }
     const prefixedPrompt = promptParts.join("\n");
-    const busy = isMainBusy();
+    const action = decideBusyAction(config.busyMode, isSessionBusy(sessionKey));
     const verbose = verboseChats.has(chatId);
     const modelOverride = chatModels.get(chatId);
     let result;
     let streamMsgId: number | null = null;
     let hadToolLines = false;
-    if (busy) {
+    if (action === "reject") {
       await sendMessage(config.token, chatId, "Claude is busy — try again in a moment, or use /fork for a quick parallel task.", threadId);
       return;
     } else {
       const stream = makeStreamCallback(config.token, chatId, threadId, { verbose });
-      result = await runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, modelOverride);
+      // No await between isSessionBusy and runUserMessage: enqueue bumps the counter synchronously.
+      const resultPromise = runUserMessage("telegram", prefixedPrompt, sessionKey, undefined, stream.onChunk, stream.onToolEvent, modelOverride);
+      if (action === "queue") {
+        sendMessage(config.token, chatId, QUEUED_TEXT, threadId).catch(() => {});
+      }
+      result = await resultPromise;
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;
       hadToolLines = streamResult.hadToolLines;

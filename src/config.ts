@@ -78,7 +78,7 @@ const DEFAULT_SETTINGS: Settings = {
     excludeWindows: [],
     forwardToTelegram: true,
   },
-  telegram: { token: "", allowedUserIds: [], listenChats: [], receiveEnabled: true, dmIsolation: "shared" },
+  telegram: { token: "", allowedUserIds: [], listenChats: [], receiveEnabled: true, dmIsolation: "shared", busyMode: "reject" },
   discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [], allowedGuilds: [], imageOutputRoots: [], streaming: false },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [], allowBots: [], allowBotIds: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
@@ -105,6 +105,12 @@ export interface HeartbeatConfig {
   forwardToTelegram: boolean;
 }
 
+export type BusyMode = "reject" | "queue";
+
+export function parseBusyMode(raw: unknown): BusyMode {
+  return raw === "queue" ? "queue" : "reject";
+}
+
 export interface TelegramConfig {
   token: string;
   allowedUserIds: number[];
@@ -117,6 +123,8 @@ export interface TelegramConfig {
    * - "perUser": each DM user gets their own isolated session.
    */
   dmIsolation: "shared" | "perUser";
+  /** When a message arrives while its session is busy: "reject" replies busy (default), "queue" runs it after the current turn. */
+  busyMode: BusyMode;
   /** Local whisper.cpp model for voice transcription. Default: "base.en".
    *  Supported values: tiny, base, small, medium, large-v3, large-v3-turbo (with or without .en suffix).
    *  Ignored when stt.baseUrl is configured. */
@@ -343,6 +351,7 @@ function parseSettings(
       listenChats: Array.isArray(raw.telegram?.listenChats) ? raw.telegram.listenChats.map(Number) : [],
       receiveEnabled: raw.telegram?.receiveEnabled !== false,
       dmIsolation: raw.telegram?.dmIsolation === "perUser" ? "perUser" : "shared",
+      busyMode: parseBusyMode(raw.telegram?.busyMode),
       ...(typeof raw.telegram?.whisperModel === "string" && raw.telegram.whisperModel.trim()
         ? { whisperModel: raw.telegram.whisperModel.trim() }
         : {}),
