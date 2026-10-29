@@ -10,7 +10,6 @@ let dbPath: string;
 let tasksDir: string;
 let store: TaskStore;
 let scheduler: Scheduler | null;
-let storeClosed: boolean;
 
 async function waitFor(cond: () => boolean, timeoutMs = 3000): Promise<void> {
   const start = Date.now();
@@ -42,13 +41,12 @@ beforeEach(() => {
   dbPath = join(dir, "tasks.db");
   tasksDir = join(dir, "tasks");
   store = openTaskStore(dbPath);
-  storeClosed = false;
   scheduler = null;
 });
 
 afterEach(() => {
   scheduler?.stop();
-  if (!storeClosed) store.close();
+  store.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -143,32 +141,35 @@ describe("scheduler", () => {
   test("results after stop are discarded", async () => {
     const errors: unknown[] = [];
     const onErr = (e: unknown) => void errors.push(e);
+    const realConsoleError = console.error;
+    const logged: unknown[][] = [];
+    console.error = (...args: unknown[]) => void logged.push(args);
     process.on("unhandledRejection", onErr);
     try {
       let release!: () => void;
       const gate = new Promise<void>((r) => (release = r));
       let started = false;
-      const s = make(async () => {
-        started = true;
-        await gate;
-        return { exitCode: 0 };
-      });
+      let outboxCalls = 0;
+      const s = make(
+        async () => {
+          started = true;
+          await gate;
+          return { exitCode: 0 };
+        },
+        { onOutbox: () => void outboxCalls++ }
+      );
       const t = add();
       s.start();
       await waitFor(() => started);
       s.stop();
-      store.close();
-      storeClosed = true;
       release();
       await new Promise((r) => setTimeout(r, 100));
+      expect(store.get(t.id)!.status).toBe("running");
+      expect(outboxCalls).toBe(0);
+      expect(logged).toEqual([]);
       expect(errors).toEqual([]);
-      const reopened = openTaskStore(dbPath);
-      try {
-        expect(reopened.get(t.id)!.status).toBe("running");
-      } finally {
-        reopened.close();
-      }
     } finally {
+      console.error = realConsoleError;
       process.off("unhandledRejection", onErr);
     }
   });
