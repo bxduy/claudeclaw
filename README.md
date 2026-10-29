@@ -102,17 +102,20 @@ The env var `CLAUDECLAW_TELEGRAM_API_BASE` overrides the Telegram API base URL (
 ### Task mode (preview)
 
 ```json
-"tasks": { "enabled": false, "maxWorkers": 5 }
+"tasks": { "enabled": false, "maxWorkers": 5, "timeoutMinutes": 120, "idleTimeoutMinutes": 20, "progressIntervalSec": 30 }
 ```
 
 | Key | Default | Meaning |
 |---|---|---|
 | `tasks.enabled` | `false` | Turns on the background task store and Telegram task commands. Needs a daemon restart. |
 | `tasks.maxWorkers` | `5` | Max tasks running at once. Hot-reloaded. |
+| `tasks.timeoutMinutes` | `120` | Wall-clock limit per task. Fractions allowed. Hot-reloaded. |
+| `tasks.idleTimeoutMinutes` | `20` | A task with no output for this long is killed and fails as `idle`. Hot-reloaded. |
+| `tasks.progressIntervalSec` | `30` | Seconds between edits of the Telegram status card. Hot-reloaded. |
 
-Telegram commands: `/task <prompt>` queues a task, `/tasks` lists recent tasks, `/status <id>` shows one task, `/cancel <id>` cancels it.
+Telegram commands: `/task <prompt>` queues a task, `/tasks` lists recent tasks, `/status <id>` shows one task, `/cancel <id>` cancels it, including a task that is already running (its process group is killed).
 
-P2 has no real executor yet: every task fails with `no_executor` until the worker runtime lands.
+Each task runs as its own `claude -p` process with the same model and permissions as normal chat. A running task shows a status card in the chat that is edited as it progresses, and the final result is sent to the same chat and thread. Results that are too long are truncated. Per-task files live under `.claude/claudeclaw/tasks/<id>/`: `events.ndjson` (the raw event stream) and `result.md` (the full result). Commands only show tasks that belong to the current chat. Tasks pause while the account is rate limited.
 
 ### v1.1.0 — Web UI bearer token gate
 

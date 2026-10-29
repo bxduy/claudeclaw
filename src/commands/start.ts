@@ -426,16 +426,41 @@ export async function start(args: string[] = []) {
   if (currentSettings.tasks.enabled) {
     if (currentSettings.telegram.token) {
       const { initTaskRuntime } = await import("../tasks");
+      const { createClaudeExecutor } = await import("../tasks/worker");
+      const { createStatusCards } = await import("../tasks/card");
+      const { callApi } = await import("./telegram");
       initTaskRuntime({
         dbPath: join(process.cwd(), ".claude", "claudeclaw", "tasks.db"),
         tasksDir: join(process.cwd(), ".claude", "claudeclaw", "tasks"),
         getMaxWorkers: () => currentSettings.tasks.maxWorkers,
+        executor: createClaudeExecutor({ cwd: process.cwd(), getTasksConfig: () => currentSettings.tasks }),
+        observer: createStatusCards({
+          api: {
+            send: async (chatId, text, threadId) =>
+              (
+                await callApi<{ result: { message_id: number } }>(currentSettings.telegram.token, "sendMessage", {
+                  chat_id: chatId,
+                  text,
+                  ...(threadId ? { message_thread_id: threadId } : {}),
+                })
+              ).result.message_id,
+            edit: async (chatId, messageId, text) => {
+              await callApi(currentSettings.telegram.token, "editMessageText", {
+                chat_id: chatId,
+                message_id: messageId,
+                text,
+              });
+            },
+          },
+          getIntervalMs: () => currentSettings.tasks.progressIntervalSec * 1000,
+        }),
+        isPaused: isRateLimited,
         send: async (chatId, text, threadId) => {
           const { sendMessage } = await import("./telegram");
-          await sendMessage(currentSettings.telegram.token, chatId, text, threadId);
+          await sendMessage(currentSettings.telegram.token, chatId, text, threadId, { retryOn429: false });
         },
       });
-      console.log(`[${ts()}] Tasks: enabled (maxWorkers ${currentSettings.tasks.maxWorkers})`);
+      console.log(`[${ts()}] Tasks: enabled (maxWorkers ${currentSettings.tasks.maxWorkers}, timeout ${currentSettings.tasks.timeoutMinutes}m, idle ${currentSettings.tasks.idleTimeoutMinutes}m)`);
     } else {
       console.warn(`[${ts()}] Tasks: enabled but Telegram is not configured; task mode disabled`);
     }

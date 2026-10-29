@@ -89,7 +89,7 @@ const DEFAULT_SETTINGS: Settings = {
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   plugins: {},
-  tasks: { enabled: false, maxWorkers: 5 },
+  tasks: { enabled: false, maxWorkers: 5, timeoutMinutes: 120, idleTimeoutMinutes: 20, progressIntervalSec: 30 },
 };
 
 export interface HeartbeatExcludeWindow {
@@ -117,6 +117,16 @@ export interface TasksConfig {
   enabled: boolean;
   /** Max concurrently running background tasks. Default: 5. */
   maxWorkers: number;
+  /** Wall-clock limit per task, in minutes (fractions allowed). Default: 120. */
+  timeoutMinutes: number;
+  /** Kill a task after this many minutes without output. Default: 20. */
+  idleTimeoutMinutes: number;
+  /** Seconds between progress card edits. Default: 30. */
+  progressIntervalSec: number;
+}
+
+function positiveNumber(v: unknown, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
 export function parseTasksSettings(raw: unknown): TasksConfig {
@@ -125,6 +135,10 @@ export function parseTasksSettings(raw: unknown): TasksConfig {
   return {
     enabled: r.enabled === true,
     maxWorkers: Number.isFinite(mw) && mw > 0 ? mw : 5,
+    // Clamped so the derived setTimeout delay stays far below its 2^31 ms overflow.
+    timeoutMinutes: Math.min(positiveNumber(r.timeoutMinutes, 120), 1440),
+    idleTimeoutMinutes: Math.min(positiveNumber(r.idleTimeoutMinutes, 20), 1440),
+    progressIntervalSec: Math.min(Math.max(positiveNumber(r.progressIntervalSec, 30), 1), 3600),
   };
 }
 
