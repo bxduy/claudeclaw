@@ -61,6 +61,7 @@ export function createScheduler(opts: {
     let exitCode: number | undefined;
     let summary: string | undefined;
     let cancelled = false;
+    let startedNotified = false;
     const controller = new AbortController();
     controllers.set(task.id, controller);
     try {
@@ -69,6 +70,7 @@ export function createScheduler(opts: {
         mkdirSync(dir, { recursive: true });
         store.setDir(task.id, dir);
         notify(() => observer?.started(task));
+        startedNotified = true;
         const outcome = await executor(task, {
           dir,
           signal: controller.signal,
@@ -77,6 +79,7 @@ export function createScheduler(opts: {
         });
         summary = outcome.summary;
         if (outcome.failureReason === "cancelled") {
+          // The canceller already moved the task to cancelled and owns that state change.
           cancelled = true;
         } else if (outcome.failureReason) {
           failureReason = outcome.failureReason;
@@ -102,7 +105,7 @@ export function createScheduler(opts: {
       }
     }
     const final = store.get(task.id);
-    if (final) notify(() => observer?.finished(final));
+    if (final && startedNotified) notify(() => observer?.finished(final));
     onOutbox?.();
     wake();
   }

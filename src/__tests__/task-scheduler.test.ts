@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync } from "fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { openTaskStore, type Task, type TaskStore } from "../tasks/store";
@@ -252,18 +252,53 @@ describe("scheduler", () => {
 
   test("cancel races completion", async () => {
     const finished: Task[] = [];
-    const s = make(async () => ({ exitCode: 0 }), {
-      observer: { started() {}, progress() {}, finished: (t) => void finished.push(t) },
-    });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started = false;
+    const s = make(
+      async () => {
+        started = true;
+        await gate;
+        return { exitCode: 0 };
+      },
+      { observer: { started() {}, progress() {}, finished: (t) => void finished.push(t) } }
+    );
     const t = add();
     s.start();
-    await waitFor(() => finished.length > 0);
+    await waitFor(() => started);
     store.transition(t.id, ["running"], "cancelled");
-    s.cancel(t.id);
+    expect(s.cancel(t.id)).toBe(true);
+    release();
+    await waitFor(() => finished.length > 0);
     await new Promise((r) => setTimeout(r, 50));
-    expect(["completed", "cancelled"]).toContain(store.get(t.id)!.status);
+    expect(store.get(t.id)!.status).toBe("cancelled");
     expect(outbox().length).toBe(1);
+    expect(outbox()[0]).toContain("🚫");
     expect(finished.length).toBe(1);
+    expect(finished[0].status).toBe("cancelled");
+    expect(s.cancel(t.id)).toBe(false);
+  });
+
+  test("no finished without started when task dir cannot be created", async () => {
+    const blocker = join(dir, "blocker");
+    writeFileSync(blocker, "x");
+    let startedCalls = 0;
+    let finishedCalls = 0;
+    scheduler = createScheduler({
+      store,
+      executor: async () => ({ exitCode: 0 }),
+      getMaxWorkers: () => 5,
+      tasksDir: join(blocker, "sub"),
+      tickMs: 60_000,
+      observer: { started: () => void startedCalls++, progress() {}, finished: () => void finishedCalls++ },
+    });
+    const t = add();
+    scheduler.start();
+    await waitFor(() => store.get(t.id)?.status === "failed");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(store.get(t.id)!.failureReason).toBe("spawn_error");
+    expect(startedCalls).toBe(0);
+    expect(finishedCalls).toBe(0);
   });
 
   test("setSessionId via ctx", async () => {
