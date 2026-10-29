@@ -76,7 +76,7 @@ function markdownToTelegramHtml(text: string): string {
 
 // --- Telegram Bot API (raw fetch, zero deps) ---
 
-const API_BASE = "https://api.telegram.org/bot";
+const API_BASE = process.env.CLAUDECLAW_TELEGRAM_API_BASE?.trim() || "https://api.telegram.org/bot";
 const FILE_API_BASE = "https://api.telegram.org/file/bot";
 
 interface TelegramUser {
@@ -388,7 +388,19 @@ function extractTelegramCommand(text: string): string | null {
   return firstToken.split("@", 1)[0].toLowerCase();
 }
 
-async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
+export class TelegramApiError extends Error {
+  constructor(
+    readonly method: string,
+    readonly code: number,
+    readonly description: string,
+    readonly retryAfter?: number
+  ) {
+    super(`Telegram API ${method}: ${code} ${description}`);
+    this.name = "TelegramApiError";
+  }
+}
+
+export async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
   // Add 15s buffer on top of Telegram's own long-poll timeout (default 30s)
   const telegramTimeout = (body?.timeout as number | undefined) ?? 0;
   const httpTimeout = Math.max(30_000, (telegramTimeout + 15) * 1000);
@@ -399,9 +411,44 @@ async function callApi<T>(token: string, method: string, body?: Record<string, u
     signal: AbortSignal.timeout(httpTimeout),
   });
   if (!res.ok) {
-    throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}`);
+    const errBody = (await res.json().catch(() => null)) as {
+      error_code?: number;
+      description?: string;
+      parameters?: { retry_after?: unknown };
+    } | null;
+    const retryAfter = errBody?.parameters?.retry_after;
+    throw new TelegramApiError(
+      method,
+      errBody?.error_code ?? res.status,
+      errBody?.description ?? res.statusText,
+      typeof retryAfter === "number" ? retryAfter : undefined
+    );
   }
   return (await res.json()) as T;
+}
+
+const MAX_SEND_ATTEMPTS = 3;
+const MAX_RETRY_AFTER_SECONDS = 60;
+
+// Retry a send on Telegram 429 when retry_after is short; rethrow anything else.
+async function callWithRetryAfter<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (
+        err instanceof TelegramApiError &&
+        err.code === 429 &&
+        err.retryAfter !== undefined &&
+        err.retryAfter <= MAX_RETRY_AFTER_SECONDS &&
+        attempt < MAX_SEND_ATTEMPTS
+      ) {
+        await Bun.sleep(err.retryAfter * 1000);
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 async function sendMessage(token: string, chatId: number, text: string, threadId?: number): Promise<void> {
@@ -410,19 +457,24 @@ async function sendMessage(token: string, chatId: number, text: string, threadId
   const MAX_LEN = 4096;
   for (let i = 0; i < html.length; i += MAX_LEN) {
     try {
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: html.slice(i, i + MAX_LEN),
-        parse_mode: "HTML",
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    } catch {
+      await callWithRetryAfter(() =>
+        callApi(token, "sendMessage", {
+          chat_id: chatId,
+          text: html.slice(i, i + MAX_LEN),
+          parse_mode: "HTML",
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        })
+      );
+    } catch (err) {
+      if (err instanceof TelegramApiError && err.code === 429) throw err;
       // Fallback to plain text if HTML parsing fails
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: normalized.slice(i, i + MAX_LEN),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
+      await callWithRetryAfter(() =>
+        callApi(token, "sendMessage", {
+          chat_id: chatId,
+          text: normalized.slice(i, i + MAX_LEN),
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        })
+      );
     }
   }
 }
@@ -756,21 +808,26 @@ async function sendMessageWithButtons(
     const isLast = i + MAX_LEN >= html.length;
     const replyMarkup = isLast ? { inline_keyboard } : undefined;
     try {
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: html.slice(i, i + MAX_LEN),
-        parse_mode: "HTML",
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    } catch {
+      await callWithRetryAfter(() =>
+        callApi(token, "sendMessage", {
+          chat_id: chatId,
+          text: html.slice(i, i + MAX_LEN),
+          parse_mode: "HTML",
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        })
+      );
+    } catch (err) {
+      if (err instanceof TelegramApiError && err.code === 429) throw err;
       // Fallback to plain text if HTML parse fails
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: normalized.slice(i, i + MAX_LEN),
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
+      await callWithRetryAfter(() =>
+        callApi(token, "sendMessage", {
+          chat_id: chatId,
+          text: normalized.slice(i, i + MAX_LEN),
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+          ...(threadId ? { message_thread_id: threadId } : {}),
+        })
+      );
     }
   }
 }
