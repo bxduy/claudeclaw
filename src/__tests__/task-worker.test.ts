@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -105,4 +105,28 @@ describe("createClaudeExecutor", () => {
       expect(out.exitCode).toBe(143);
     });
   }
+  describe("result.md write failure", () => {
+    const missing = () => join(dir, "nope", "deeper");
+    test("keeps outcome and notes the missing file", async () => {
+      const spy = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const { exec, ctx } = setup({ result: "partial", exitCode: 143, reason: "timeout" });
+        const out = await exec(task, { ...ctx, dir: missing() });
+        expect(out).toEqual({ exitCode: 143, failureReason: "timeout", summary: "partial\n\n(result.md could not be written)" });
+        expect(spy).toHaveBeenCalled();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+    test("truncated result uses the unwritten-file suffix", async () => {
+      const spy = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const { exec, ctx } = setup({ result: "a".repeat(5000) });
+        const out = await exec(task, { ...ctx, dir: missing() });
+        expect(out.summary).toBe("a".repeat(3000) + "\n\n(truncated; result.md could not be written)");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
 });

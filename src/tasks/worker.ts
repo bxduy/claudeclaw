@@ -49,10 +49,18 @@ export function createClaudeExecutor(opts: {
       },
     });
     const body = res.result || res.stderr;
-    writeFileSync(join(ctx.dir, "result.md"), body);
-    const summary = body.length > SUMMARY_LIMIT
-      ? `${body.slice(0, SUMMARY_LIMIT)}\n\n(truncated, full result: tasks/${task.id}/result.md)`
-      : body;
+    let written = true;
+    try {
+      writeFileSync(join(ctx.dir, "result.md"), body);
+    } catch (err) {
+      written = false;
+      console.error(`[tasks] failed to write result.md for ${task.id}:`, err);
+    }
+    const truncated = body.length > SUMMARY_LIMIT;
+    let summary = truncated ? body.slice(0, SUMMARY_LIMIT) : body;
+    if (written && truncated) summary += `\n\n(truncated, full result: tasks/${task.id}/result.md)`;
+    else if (truncated) summary += "\n\n(truncated; result.md could not be written)";
+    else if (!written) summary += "\n\n(result.md could not be written)";
     return { exitCode: res.exitCode, summary, ...(res.reason ? { failureReason: res.reason } : {}) };
   };
 }
