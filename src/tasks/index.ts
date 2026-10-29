@@ -30,7 +30,12 @@ export function initTaskRuntime(opts: {
     scheduler,
     notifier,
     getMaxWorkers: opts.getMaxWorkers,
-    cancel: (id) => (scheduler.cancel(id) ? "cancelled" : "not_running"),
+    cancel: (id) => {
+      // Move the task out of running first; the scheduler skips its own transition on "cancelled".
+      if (!store.transition(id, ["running"], "cancelled")) return "not_running";
+      scheduler.cancel(id);
+      return "cancelled";
+    },
   };
   setTaskRuntime(runtime);
   return runtime;

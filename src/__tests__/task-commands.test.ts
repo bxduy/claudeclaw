@@ -15,6 +15,7 @@ let dir: string;
 let store: TaskStore;
 let wakes: number;
 let cancels: string[];
+let cancelHook: (() => void) | null;
 let cancelResult: "cancelled" | "not_running";
 let runtime: TaskRuntime;
 let clock: number;
@@ -28,6 +29,7 @@ beforeEach(() => {
   wakes = 0;
   cancels = [];
   cancelResult = "cancelled";
+  cancelHook = null;
   runtime = {
     store,
     scheduler: { start() {}, stop() {}, wake: () => void wakes++, cancel: () => false },
@@ -35,6 +37,7 @@ beforeEach(() => {
     getMaxWorkers: () => 5,
     cancel: (id) => {
       cancels.push(id);
+      cancelHook?.();
       return cancelResult;
     },
   };
@@ -137,7 +140,8 @@ describe("/cancel", () => {
     const task = store.create({ prompt: "x", chatId: 42 });
     store.claim(5);
     cancelResult = "not_running";
-    expect(reply("/cancel", `/cancel ${task.id}`)).toBe(`Task ${task.id} is already running.`);
+    cancelHook = () => store.transition(task.id, ["running"], "completed", { exitCode: 0 });
+    expect(reply("/cancel", `/cancel ${task.id}`)).toBe(`Task ${task.id} is already completed.`);
     expect(cancels).toEqual([task.id]);
   });
 

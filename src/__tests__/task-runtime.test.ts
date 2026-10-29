@@ -66,6 +66,40 @@ describe("task runtime", () => {
     expect(t.failureReason).toBe("interrupted");
   });
 
+  test("cancel moves a running task to cancelled, aborts executor, notifies once (SC-7)", async () => {
+    let aborted = false;
+    let started = false;
+    initTaskRuntime({
+      dbPath,
+      tasksDir,
+      getMaxWorkers: () => 5,
+      send: async (chatId, text, threadId) => {
+        sent.push([chatId, text, threadId]);
+      },
+      schedulerTickMs: 20,
+      notifierTickMs: 20,
+      executor: (_task, ctx) =>
+        new Promise((resolve) => {
+          started = true;
+          ctx.signal.addEventListener("abort", () => {
+            aborted = true;
+            resolve({ exitCode: 1, failureReason: "cancelled" });
+          });
+        }),
+    });
+    const rt = getTaskRuntime()!;
+    const task = rt.store.create({ prompt: "long", chatId: 1 });
+    rt.scheduler.wake();
+    await waitFor(() => started);
+    expect(rt.cancel(task.id)).toBe("cancelled");
+    await waitFor(() => aborted);
+    await waitFor(() => sent.some((s) => s[1].startsWith("🚫")));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(rt.store.get(task.id)!.status).toBe("cancelled");
+    expect(sent.filter((s) => s[1] === `🚫 Task ${task.id} cancelled.`)).toHaveLength(1);
+    expect(rt.cancel(task.id)).toBe("not_running");
+  });
+
   test("stop clears runtime", () => {
     init();
     expect(getTaskRuntime()).not.toBeNull();

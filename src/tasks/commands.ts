@@ -80,8 +80,9 @@ export function taskCommandReply(
   }
   // Re-read: the task may have been claimed between get and transition.
   const current = store.get(id)!;
-  if (current.status === "running" && runtime.cancel(id) === "cancelled") {
-    return `Cancelling task ${id}.`;
+  if (current.status === "running") {
+    if (runtime.cancel(id) === "cancelled") return `Cancelling task ${id}.`;
+    return `Task ${id} is already ${store.get(id)!.status}.`;
   }
   return `Task ${id} is already ${current.status}.`;
 }
