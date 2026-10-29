@@ -89,6 +89,7 @@ const DEFAULT_SETTINGS: Settings = {
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   plugins: {},
+  tasks: { enabled: false, maxWorkers: 5 },
 };
 
 export interface HeartbeatExcludeWindow {
@@ -109,6 +110,22 @@ export type BusyMode = "reject" | "queue";
 
 export function parseBusyMode(raw: unknown): BusyMode {
   return raw === "queue" ? "queue" : "reject";
+}
+
+export interface TasksConfig {
+  /** Enables the background task store, scheduler and notifier. Default: false. */
+  enabled: boolean;
+  /** Max concurrently running background tasks. Default: 5. */
+  maxWorkers: number;
+}
+
+export function parseTasksSettings(raw: unknown): TasksConfig {
+  const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const mw = typeof r.maxWorkers === "number" ? Math.floor(r.maxWorkers) : NaN;
+  return {
+    enabled: r.enabled === true,
+    maxWorkers: Number.isFinite(mw) && mw > 0 ? mw : 5,
+  };
 }
 
 export interface TelegramConfig {
@@ -195,6 +212,7 @@ export interface Settings {
   watchdog: WatchdogSettings;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
+  tasks: TasksConfig;
   jobsDir?: string;
 }
 
@@ -435,6 +453,7 @@ function parseSettings(
       maxAgeHours: Number.isFinite(raw.session?.maxAgeHours) ? Number(raw.session.maxAgeHours) : 24,
       summaryPath: typeof raw.session?.summaryPath === "string" ? raw.session.summaryPath.trim() : "",
     },
+    tasks: parseTasksSettings(raw.tasks),
     apiToken: typeof raw.apiToken === "string" && raw.apiToken.trim() ? raw.apiToken.trim() : undefined,
     ...(typeof raw.jobsDir === "string" && raw.jobsDir.trim() ? { jobsDir: raw.jobsDir.trim() } : {}),
   };
