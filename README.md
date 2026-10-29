@@ -99,6 +99,21 @@ With `"shared"`, DMs use the same queue as the heartbeat and pending-resume, so 
 
 The env var `CLAUDECLAW_TELEGRAM_API_BASE` overrides the Telegram API base URL (default `https://api.telegram.org/bot`); it exists for tests.
 
+### Task mode (preview)
+
+```json
+"tasks": { "enabled": false, "maxWorkers": 5 }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `tasks.enabled` | `false` | Turns on the background task store and Telegram task commands. Needs a daemon restart. |
+| `tasks.maxWorkers` | `5` | Max tasks running at once. Hot-reloaded. |
+
+Telegram commands: `/task <prompt>` queues a task, `/tasks` lists recent tasks, `/status <id>` shows one task, `/cancel <id>` cancels it.
+
+P2 has no real executor yet: every task fails with `no_executor` until the worker runtime lands.
+
 ### v1.1.0 — Web UI bearer token gate
 
 All `/api/*` routes (except `/api/health`) now require an `Authorization: Bearer <token>` header. The token is auto-generated on first start and written to `.claude/claudeclaw/web.token`. The daemon also prints the full URL with the token embedded when the web UI starts.
