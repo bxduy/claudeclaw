@@ -361,6 +361,12 @@ export async function start(args: string[] = []) {
     if (slackStopFn) slackStopFn();
     if (web) web.stop();
     await teardownStatusline();
+    try {
+      const { stopTaskRuntime } = await import("../tasks");
+      stopTaskRuntime();
+    } catch (err) {
+      console.error(`[${ts()}] Tasks: stop failed: ${err instanceof Error ? err.message : err}`);
+    }
     await cleanupPidFile();
     process.exit(0);
   }
@@ -414,6 +420,24 @@ export async function start(args: string[] = []) {
       telegramSend = null;
       telegramToken = "";
       console.log(`[${ts()}] Telegram: disabled`);
+    }
+  }
+
+  if (currentSettings.tasks.enabled) {
+    if (currentSettings.telegram.token) {
+      const { initTaskRuntime } = await import("../tasks");
+      initTaskRuntime({
+        dbPath: join(process.cwd(), ".claude", "claudeclaw", "tasks.db"),
+        tasksDir: join(process.cwd(), ".claude", "claudeclaw", "tasks"),
+        getMaxWorkers: () => currentSettings.tasks.maxWorkers,
+        send: async (chatId, text, threadId) => {
+          const { sendMessage } = await import("./telegram");
+          await sendMessage(currentSettings.telegram.token, chatId, text, threadId);
+        },
+      });
+      console.log(`[${ts()}] Tasks: enabled (maxWorkers ${currentSettings.tasks.maxWorkers})`);
+    } else {
+      console.warn(`[${ts()}] Tasks: enabled but Telegram is not configured; task mode disabled`);
     }
   }
 
