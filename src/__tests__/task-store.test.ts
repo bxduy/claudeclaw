@@ -338,3 +338,77 @@ describe("outbox", () => {
     expect(row).toEqual({ state: "dead", attempts: 10, last_error: "gone" });
   });
 });
+
+function runningTask(store: TaskStore, chatId = 1) {
+  const t = store.create({ prompt: "p", chatId });
+  store.claim(10);
+  return t;
+}
+
+function outboxTexts(store: TaskStore): string[] {
+  return (store.db.query("SELECT text FROM outbox ORDER BY id").all() as { text: string }[]).map((r) => r.text);
+}
+
+describe("sessions, summaries, chat filter, pruning", () => {
+  test("setSessionId stores session", () => {
+    const store = open();
+    const t = runningTask(store);
+    store.setSessionId(t.id, "s-1");
+    expect(store.get(t.id)?.sessionId).toBe("s-1");
+  });
+
+  test("summary appended for completed and failed", () => {
+    const store = open({ randomId: ids("t-aaaa", "t-bbbb", "t-cccc") });
+    const a = runningTask(store);
+    store.transition(a.id, ["running"], "completed", { summary: "ok" });
+    const b = runningTask(store);
+    store.transition(b.id, ["running"], "failed", { failureReason: "idle", summary: "log" });
+    const c = runningTask(store);
+    store.transition(c.id, ["running"], "completed", { summary: "" });
+    expect(outboxTexts(store)).toEqual([
+      "✅ Task t-aaaa completed.\n\nok",
+      "❌ Task t-bbbb failed (idle).\n\nlog",
+      "✅ Task t-cccc completed.",
+    ]);
+  });
+
+  test("summary ignored for cancelled", () => {
+    const store = open({ randomId: ids("t-dddd") });
+    const t = runningTask(store);
+    store.transition(t.id, ["running"], "cancelled", { summary: "x" });
+    expect(outboxTexts(store)).toEqual(["🚫 Task t-dddd cancelled."]);
+  });
+
+  test("list filters by chat", () => {
+    const store = open({ randomId: ids("t-1111", "t-2222") });
+    store.create({ prompt: "a", chatId: 1 });
+    store.create({ prompt: "b", chatId: 2 });
+    expect(store.list(10, 1).map((t) => t.id)).toEqual(["t-1111"]);
+    expect(store.list(10).map((t) => t.id).sort()).toEqual(["t-1111", "t-2222"]);
+  });
+
+  test("pruneOutbox removes old sent and dead rows only", () => {
+    const day = 86_400_000;
+    clock = 100 * day;
+    const store = open({ randomId: ids("t-p1", "t-p2", "t-p3", "t-p4") });
+    const rows: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      const t = runningTask(store);
+      store.transition(t.id, ["running"], "completed");
+      rows.push((store.db.query("SELECT id FROM outbox WHERE task_id = ?").get(t.id) as { id: number }).id);
+    }
+    const [oldSent, newSent, oldPending, oldDead] = rows;
+    store.markSent(oldSent, clock);
+    store.markSent(newSent, clock);
+    store.markFailed(oldDead, { attempts: 10, nextAttemptAt: 0, lastError: "x", dead: true });
+    const setAge = (id: number, days: number) =>
+      store.db.query("UPDATE outbox SET created_at = ? WHERE id = ?").run(clock - days * day, id);
+    setAge(oldSent, 8);
+    setAge(newSent, 1);
+    setAge(oldPending, 8);
+    setAge(oldDead, 8);
+    expect(store.pruneOutbox(7 * day)).toBe(2);
+    const left = (store.db.query("SELECT id FROM outbox ORDER BY id").all() as { id: number }[]).map((r) => r.id);
+    expect(left).toEqual([newSent, oldPending]);
+  });
+});

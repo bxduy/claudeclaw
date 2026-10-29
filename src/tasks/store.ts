@@ -36,20 +36,22 @@ export interface TaskStore {
   readonly db: Database;
   create(input: { prompt: string; chatId: number; threadId?: number; userId?: number }): Task;
   get(id: string): Task | null;
-  list(limit: number): Task[];
+  list(limit: number, chatId?: number): Task[];
   countRunning(): number;
   claim(maxWorkers: number): Task | null;
   transition(
     id: string,
     from: TaskStatus[],
     to: TaskStatus,
-    fields?: { exitCode?: number; failureReason?: string }
+    fields?: { exitCode?: number; failureReason?: string; summary?: string }
   ): Task | null;
   setDir(id: string, dir: string): void;
+  setSessionId(id: string, sessionId: string): void;
   failInterrupted(): number;
   pendingOutbox(now: number): OutboxRow[];
   markSent(id: number, now: number): void;
   markFailed(id: number, update: { attempts: number; nextAttemptAt: number; lastError: string; dead: boolean }): void;
+  pruneOutbox(olderThanMs: number): number;
   close(): void;
 }
 
@@ -171,9 +173,10 @@ function toOutbox(row: OutboxDbRow): OutboxRow {
   };
 }
 
-function notificationText(task: Task): string {
-  if (task.status === "completed") return `✅ Task ${task.id} completed.`;
-  if (task.status === "failed") return `❌ Task ${task.id} failed (${task.failureReason}).`;
+function notificationText(task: Task, summary?: string): string {
+  const tail = summary ? `\n\n${summary}` : "";
+  if (task.status === "completed") return `✅ Task ${task.id} completed.${tail}`;
+  if (task.status === "failed") return `❌ Task ${task.id} failed (${task.failureReason}).${tail}`;
   return `🚫 Task ${task.id} cancelled.`;
 }
 
@@ -236,7 +239,7 @@ export function openTaskStore(
     id: string,
     from: TaskStatus[],
     to: TaskStatus,
-    fields: { exitCode?: number; failureReason?: string }
+    fields: { exitCode?: number; failureReason?: string; summary?: string }
   ): Task | null {
     const previous = get(id);
     const ts = now();
@@ -266,7 +269,7 @@ export function openTaskStore(
     if (!row) return null;
     const task = toTask(row);
     if (previous?.status === "running" && TERMINAL.has(to)) {
-      insertOutbox.run(task.id, task.chatId, task.threadId, notificationText(task), ts, ts);
+      insertOutbox.run(task.id, task.chatId, task.threadId, notificationText(task, fields.summary), ts, ts);
     }
     return task;
   }
@@ -275,7 +278,7 @@ export function openTaskStore(
     id: string,
     from: TaskStatus[],
     to: TaskStatus,
-    fields: { exitCode?: number; failureReason?: string } = {}
+    fields: { exitCode?: number; failureReason?: string; summary?: string } = {}
   ): Task | null {
     if (from.length === 0) throw new Error(`Illegal task transition: [] -> ${to}`);
     for (const f of from) {
@@ -315,10 +318,14 @@ export function openTaskStore(
     db,
     create,
     get,
-    list(limit) {
-      const rows = db
-        .query("SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT ?")
-        .all(limit) as TaskRow[];
+    list(limit, chatId) {
+      const rows = (
+        chatId === undefined
+          ? db.query("SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC LIMIT ?").all(limit)
+          : db
+              .query("SELECT * FROM tasks WHERE chat_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?")
+              .all(chatId, limit)
+      ) as TaskRow[];
       return rows.map(toTask);
     },
     countRunning,
@@ -326,6 +333,9 @@ export function openTaskStore(
     transition,
     setDir(id, dir) {
       db.query("UPDATE tasks SET dir = ? WHERE id = ?").run(dir, id);
+    },
+    setSessionId(id, sessionId) {
+      db.query("UPDATE tasks SET session_id = ? WHERE id = ?").run(sessionId, id);
     },
     failInterrupted,
     pendingOutbox(at) {
@@ -341,6 +351,11 @@ export function openTaskStore(
       db.query(
         "UPDATE outbox SET state = ?, attempts = ?, next_attempt_at = ?, last_error = ? WHERE id = ?"
       ).run(update.dead ? "dead" : "pending", update.attempts, update.nextAttemptAt, update.lastError, id);
+    },
+    pruneOutbox(olderThanMs) {
+      return db
+        .query("DELETE FROM outbox WHERE state IN ('sent', 'dead') AND created_at < ?")
+        .run(now() - olderThanMs).changes;
     },
     close() {
       db.close();
