@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile, realpath } from "fs/promises";
 import { join, dirname, resolve, sep } from "path";
 import { execSync } from "child_process";
-import { existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
+import { appendFileSync, existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import {
   getSession,
   createSession,
@@ -240,6 +240,16 @@ export function wasRateLimitNotified(): boolean {
 
 export function markRateLimitNotified(): void {
   rateLimitNotified = true;
+}
+
+/** Record a rate-limit hit: reset time parsed from the message, else now + 60 min. */
+export function noteRateLimit(message: string): void {
+  const resetTime = parseRateLimitResetTime(message);
+  rateLimitResetAt = resetTime ?? (Date.now() + 60 * 60_000);
+  rateLimitNotified = false;
+  console.warn(
+    `[${new Date().toLocaleTimeString()}] Rate limit detected. Reset at: ${new Date(rateLimitResetAt).toISOString()}`
+  );
 }
 
 // Serial queue — prevents concurrent --resume on the same session
@@ -608,6 +618,211 @@ async function runClaudeStream(
     console.error(`[${new Date().toLocaleTimeString()}] ${message}`);
     return { rawStdout: "", stderr: message, exitCode: 124, sessionId };
   }
+}
+
+// --- Background task runs ---
+
+export const TASK_SYSTEM_PROMPT =
+  "You are running as a ClaudeClaw background task. No human is watching this session, so do not wait for input. Your final message is sent to the user on Telegram: end with a short summary and any links (for example a PR URL).";
+
+/** Extra deny-list for task runs: merging is the user's decision, never a task's. */
+export const TASK_DISALLOWED_TOOLS = ["Bash(gh pr merge:*)"];
+
+const TASK_KILL_GRACE_MS = 5000;
+
+export interface TaskRunOptions {
+  prompt: string;
+  sessionId: string;
+  cwd: string;
+  timeoutMs: number;
+  idleTimeoutMs: number;
+  eventLogPath: string;
+  signal?: AbortSignal;
+  onEvent?: (event: Record<string, unknown>) => void;
+  executable?: string;
+  settings?: { security: SecurityConfig; model: string; api: string };
+}
+
+export interface TaskRunResult {
+  exitCode: number;
+  result: string;
+  stderr: string;
+  reason?: "timeout" | "idle" | "cancelled" | "rate_limit";
+}
+
+/** Append one line (plus newline) to the event log until `written.bytes` reaches `cap`. */
+export function appendEventLine(path: string, line: string, written: { bytes: number }, cap: number): void {
+  if (written.bytes >= cap) return;
+  const data = `${line}\n`;
+  appendFileSync(path, data);
+  written.bytes += Buffer.byteLength(data);
+}
+
+function signalGroup(pgid: number, sig: "SIGTERM" | "SIGKILL"): void {
+  try {
+    process.kill(-pgid, sig);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+      console.error(`[${new Date().toLocaleTimeString()}] Failed to ${sig} task process group ${pgid}:`, err);
+    }
+  }
+}
+
+/** Wait (bounded) until no process is left in the group; killed members may linger briefly before reaping. */
+async function waitForGroupExit(pgid: number, maxMs: number): Promise<void> {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(-pgid, 0);
+    } catch {
+      return;
+    }
+    await Bun.sleep(10);
+  }
+}
+
+/**
+ * Run one `claude -p` turn for a background task in its own process group.
+ * Stops it on idle, total timeout or abort, killing the whole group (claude and
+ * anything it spawned). Never throws for a non-zero or killed exit; only when the
+ * spawn itself fails. Not tracked in mainActiveProcs, so /kill leaves it alone.
+ */
+export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult> {
+  const { security, model, api } = opts.settings ?? getSettings();
+  const taskSecurity: SecurityConfig = {
+    ...security,
+    disallowedTools: [...security.disallowedTools, ...TASK_DISALLOWED_TOOLS],
+  };
+  const systemPrompt = security.level !== "unrestricted"
+    ? `${TASK_SYSTEM_PROMPT}\n\n${DIR_SCOPE_PROMPT}`
+    : TASK_SYSTEM_PROMPT;
+  const args = [
+    opts.executable ?? CLAUDE_EXECUTABLE,
+    "-p", opts.prompt,
+    "--output-format", "stream-json",
+    "--verbose",
+    "--session-id", opts.sessionId,
+    ...buildSecurityArgs(taskSecurity),
+    "--append-system-prompt", systemPrompt,
+  ];
+  const normalizedModel = model.trim().toLowerCase();
+  if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
+
+  // detached: the child leads a new process group (pgid === pid), so -pid reaches its descendants.
+  const proc = Bun.spawn(args, {
+    cwd: opts.cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: buildChildEnv(cleanSpawnEnv(), model, api),
+    detached: true,
+  });
+  const pgid = proc.pid;
+
+  let reason: TaskRunResult["reason"];
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const stop = (why: "timeout" | "idle" | "cancelled", sig: "SIGTERM" | "SIGKILL" = "SIGTERM") => {
+    reason ??= why;
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    signalGroup(pgid, sig);
+    if (sig === "SIGTERM" && !graceTimer) {
+      graceTimer = setTimeout(() => signalGroup(pgid, "SIGKILL"), TASK_KILL_GRACE_MS);
+    }
+  };
+  const armIdle = () => {
+    if (reason) return;
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => stop("idle"), opts.idleTimeoutMs);
+  };
+  // Shutdown exits the daemon right after aborting, so there is no time for a SIGTERM grace period.
+  const onAbort = () => stop("cancelled", opts.signal?.reason === "shutdown" ? "SIGKILL" : "SIGTERM");
+
+  const totalTimer = setTimeout(() => stop("timeout"), opts.timeoutMs);
+  armIdle();
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
+  if (opts.signal?.aborted) onAbort();
+
+  let result = "";
+  const written = { bytes: 0 };
+  let eventLogFailed = false;
+  const handleLine = (line: string) => {
+    armIdle();
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    try {
+      appendEventLine(opts.eventLogPath, trimmed, written, MAX_OUTPUT_BYTES);
+    } catch (err) {
+      if (!eventLogFailed) {
+        eventLogFailed = true;
+        console.error(`[${new Date().toLocaleTimeString()}] Failed to write task event log ${opts.eventLogPath}:`, err);
+      }
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const event = parsed as Record<string, unknown>;
+    if (event.type === "result" && typeof event.result === "string") result = event.result;
+    try {
+      opts.onEvent?.(event);
+    } catch (err) {
+      console.error(`[${new Date().toLocaleTimeString()}] Task onEvent handler failed:`, err);
+    }
+  };
+
+  const readStdout = async () => {
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) handleLine(line);
+      }
+      buf += decoder.decode();
+      if (buf) handleLine(buf);
+    } finally {
+      reader.releaseLock();
+    }
+  };
+
+  const stdoutDone = readStdout();
+  const stderrDone = collectStream(proc.stderr as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES);
+
+  let exitCode: number;
+  let stderr: string;
+  try {
+    exitCode = await proc.exited;
+    // Kill anything claude left behind in its group; this also closes pipes they hold.
+    signalGroup(pgid, "SIGKILL");
+    [, stderr] = await Promise.all([stdoutDone, stderrDone]);
+    await waitForGroupExit(pgid, 1000);
+  } finally {
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    clearTimeout(graceTimer);
+    opts.signal?.removeEventListener("abort", onAbort);
+  }
+  stderr = stderr.trim();
+
+  if (!reason) {
+    const rateLimitMessage = extractRateLimitMessage(result, stderr);
+    if (rateLimitMessage) {
+      reason = "rate_limit";
+      noteRateLimit(rateLimitMessage);
+    }
+  }
+
+  return { exitCode, result, stderr, ...(reason ? { reason } : {}) };
 }
 
 function formatToolCallSummary(name: string, input: Record<string, unknown>): string {
@@ -1296,12 +1511,7 @@ async function execClaude(
 
   if (rateLimitMessage) {
     stdout = rateLimitMessage;
-    const resetTime = parseRateLimitResetTime(rateLimitMessage);
-    rateLimitResetAt = resetTime ?? (Date.now() + 60 * 60_000);
-    rateLimitNotified = false;
-    console.warn(
-      `[${new Date().toLocaleTimeString()}] Rate limit detected. Reset at: ${new Date(rateLimitResetAt).toISOString()}`
-    );
+    noteRateLimit(rateLimitMessage);
   }
 
   // Surface stderr when the result event never arrived (abort, tool error, etc.)
