@@ -83,6 +83,30 @@ describe("handleInject", () => {
     }
   });
 
+  test("failed run is not delivered", async () => {
+    const { deps, deliverCalls } = setup("error text");
+    deps.run = async () => ({ stdout: "error text", stderr: "", exitCode: 1 });
+    const res = await handleInject({ message: "x", chatId: -1001, threadId: 7 }, deps);
+    expect(deliverCalls.length).toBe(0);
+    expect(res.body.delivered).toBe(false);
+    expect(res.body.exitCode).toBe(1);
+  });
+
+  test("deliver failure log masks the bot token", async () => {
+    const spy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { deps } = setup("ok", async () => {
+        throw new Error("fetch https://api.telegram.org/bot123456:AA-b_c/sendMessage failed");
+      });
+      await handleInject({ message: "x" }, deps);
+      const logged = String(spy.mock.calls[0][0]);
+      expect(logged).toContain("bot***");
+      expect(logged).not.toContain("123456:AA-b_c");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   test("empty stdout is not delivered", async () => {
     const { deps, deliverCalls } = setup("  ");
     const res = await handleInject({ message: "x" }, deps);

@@ -4,12 +4,14 @@ import { tmpdir } from "os";
 import { join } from "path";
 import {
   appendEventLine,
+  INJECT_DISALLOWED_TOOLS,
   isRateLimited,
   killTaskProcesses,
   runTaskClaude,
   TASK_DISALLOWED_TOOLS,
   TASK_SYSTEM_PROMPT,
   type TaskRunOptions,
+  withExtraDisallowedTools,
 } from "../runner";
 
 let dir: string;
@@ -81,6 +83,25 @@ describe("TASK_SYSTEM_PROMPT", () => {
       "You are running as a ClaudeClaw background task. No human is watching this session, so do not wait for input. Your final message is sent to the user on Telegram: end with a short summary and any links (for example a PR URL)."
     );
     expect(TASK_DISALLOWED_TOOLS).toEqual(["Bash(gh pr merge:*)"]);
+  });
+});
+
+describe("withExtraDisallowedTools", () => {
+  test("appends the inject deny-list to settings.security", () => {
+    const security = { level: "moderate" as const, allowedTools: ["Read"], disallowedTools: ["WebSearch"] };
+    const merged = withExtraDisallowedTools(security, INJECT_DISALLOWED_TOOLS);
+    expect(merged.disallowedTools).toEqual(["WebSearch", ...INJECT_DISALLOWED_TOOLS]);
+    expect(merged.allowedTools).toEqual(["Read"]);
+    expect(security.disallowedTools).toEqual(["WebSearch"]);
+    for (const t of ["Edit", "Write", "NotebookEdit", "mcp__telegram", "Bash(git push:*)", "Bash(git commit:*)", "Bash(gh pr merge:*)"]) {
+      expect(INJECT_DISALLOWED_TOOLS).toContain(t);
+    }
+  });
+
+  test("no extras leaves security unchanged", () => {
+    const security = { level: "moderate" as const, allowedTools: [], disallowedTools: ["X"] };
+    expect(withExtraDisallowedTools(security)).toBe(security);
+    expect(withExtraDisallowedTools(security, [])).toBe(security);
   });
 });
 

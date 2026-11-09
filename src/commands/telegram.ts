@@ -8,7 +8,7 @@ import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { findSessionJsonlPath } from "../sessionFiles";
 import { resolveSkillPrompt, listSkills } from "../skills";
 import { mkdir } from "node:fs/promises";
@@ -534,7 +534,8 @@ async function deliverTelegramText(
   token: string,
   chatId: number,
   text: string,
-  threadId?: number
+  threadId?: number,
+  fileRoot?: string
 ): Promise<void> {
   const { cleanedText, filePaths } = extractSendFileDirectives(text);
   const body = cleanedText.replace(/\[react:[^\]\r\n]+\]/gi, "").trim();
@@ -547,8 +548,20 @@ async function deliverTelegramText(
     }
   };
   if (body) await attempt(() => sendMessage(token, chatId, body, threadId));
+  const root = fileRoot ? (await realpath(fileRoot)) + "/" : undefined;
   for (const filePath of filePaths) {
-    await attempt(() => sendDocumentToChat(token, chatId, filePath, threadId));
+    await attempt(async () => {
+      const resolved = await realpath(filePath).catch(() => undefined);
+      if (resolved === undefined) {
+        console.error(`[Telegram] send-file missing: ${filePath}`);
+        throw new Error(`send-file missing: ${filePath}`);
+      }
+      if (root && !resolved.startsWith(root)) {
+        console.error(`[Telegram] send-file outside outbox: ${filePath}`);
+        throw new Error(`send-file outside outbox: ${filePath}`);
+      }
+      await sendDocumentToChat(token, chatId, resolved, threadId);
+    });
   }
   if (firstError !== undefined) throw firstError;
 }

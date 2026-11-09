@@ -1,12 +1,20 @@
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { deliverTelegramText } from "../commands/telegram";
 
 const realFetch = globalThis.fetch;
 const FILE = "/tmp/zd-test.md";
+const ROOT = mkdtempSync(join(tmpdir(), "zd-outbox-"));
+const INSIDE = join(ROOT, "digest.md");
+const SIBLING = `${ROOT}-escape.md`;
 
 beforeAll(() => {
   writeFileSync(FILE, "hello");
+  mkdirSync(ROOT, { recursive: true });
+  writeFileSync(INSIDE, "digest");
+  writeFileSync(SIBLING, "secret");
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
@@ -55,6 +63,40 @@ describe("deliverTelegramText", () => {
     const calls = mockFetch();
     await deliverTelegramText("t", 1, "[react:👍]");
     expect(calls.length).toBe(0);
+  });
+
+  test("deliverTelegramText refuses a file outside fileRoot", async () => {
+    const calls = mockFetch();
+    await expect(deliverTelegramText("t", 1, `hi\n[send-file:${FILE}]`, 7, ROOT)).rejects.toThrow(
+      "outside outbox"
+    );
+    expect(calls.filter((c) => c.url.endsWith("/sendDocument")).length).toBe(0);
+    expect(calls.filter((c) => c.url.endsWith("/sendMessage")).length).toBe(1);
+  });
+
+  test("deliverTelegramText refuses a ../ escape to a sibling sharing the root prefix", async () => {
+    const calls = mockFetch();
+    await expect(
+      deliverTelegramText("t", 1, `[send-file:${ROOT}/../${SIBLING.split("/").pop()}]`, undefined, ROOT)
+    ).rejects.toThrow("outside outbox");
+    expect(calls.filter((c) => c.url.endsWith("/sendDocument")).length).toBe(0);
+  });
+
+  test("deliverTelegramText uploads a file inside fileRoot", async () => {
+    const calls = mockFetch();
+    await deliverTelegramText("t", 1, `[send-file:${INSIDE}]`, 7, ROOT);
+    expect(calls.filter((c) => c.url.endsWith("/sendDocument")).length).toBe(1);
+  });
+
+  test("deliverTelegramText throws on a missing file", async () => {
+    const calls = mockFetch();
+    await expect(deliverTelegramText("t", 1, `[send-file:${ROOT}/nope.md]`, 7, ROOT)).rejects.toThrow(
+      "missing"
+    );
+    await expect(deliverTelegramText("t", 1, `[send-file:/tmp/zd-nope-${Date.now()}.md]`)).rejects.toThrow(
+      "missing"
+    );
+    expect(calls.filter((c) => c.url.endsWith("/sendDocument")).length).toBe(0);
   });
 
   test("deliverTelegramText rethrows after trying the file", async () => {

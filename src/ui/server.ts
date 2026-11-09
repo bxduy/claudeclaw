@@ -8,9 +8,11 @@ import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 import { listSessions, readSessionMessages, listAgents } from "./services/sessions";
 import { getSessionUsage } from "./services/usage";
-import { runUserMessage } from "../runner";
+import { runInjectMessage, runUserMessage } from "../runner";
+import { HEARTBEAT_DIR } from "../config";
 import { handleInject } from "./inject";
 import { tmpdir } from "os";
+import { join } from "path";
 import { randomUUID } from "crypto";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
@@ -245,11 +247,14 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           const { telegram } = opts.getSnapshot().settings;
           const token = telegram.token;
           const res = await handleInject(body, {
-            run: (m, k) => runUserMessage("inject", m, k),
+            run: (m, k) => (k ? runInjectMessage(m, k) : runUserMessage("inject", m)),
             deliver: token
               ? async (chatId, text, threadId) => {
                   const { deliverTelegramText } = await import("../commands/telegram");
-                  await deliverTelegramText(token, chatId, text, threadId);
+                  const { mkdir } = await import("fs/promises");
+                  const outbox = join(HEARTBEAT_DIR, "outbox");
+                  await mkdir(outbox, { recursive: true });
+                  await deliverTelegramText(token, chatId, text, threadId, outbox);
                 }
               : undefined,
             defaultChatId: telegram.allowedUserIds[0],

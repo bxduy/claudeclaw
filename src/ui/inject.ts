@@ -30,12 +30,13 @@ export async function handleInject(body: unknown, deps: InjectDeps): Promise<Inj
   const text = result.stdout.trim();
   const target = (chatId as number | undefined) ?? deps.defaultChatId;
   let delivered = false;
-  if (text && deps.deliver && target !== undefined) {
+  if (result.exitCode === 0 && text && deps.deliver && target !== undefined) {
     try {
       await deps.deliver(target, text, threadId as number | undefined);
       delivered = true;
     } catch (err) {
-      console.error("[inject] deliver failed", err);
+      const detail = String((err as Error)?.message ?? err).replace(/bot\d+:[\w-]+/g, "bot***");
+      console.error(`[inject] deliver failed: ${detail}`);
     }
   }
   return { status: 200, body: { ok: true, result: result.stdout, exitCode: result.exitCode, delivered } };
