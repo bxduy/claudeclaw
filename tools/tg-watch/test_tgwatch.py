@@ -374,7 +374,7 @@ class PromptTest(unittest.TestCase):
             return build_prompt(src, Batch(messages=[m], first_at=0.0, last_at=0.0),
                                 Config(enabled=True, sources=[src]))
         self.assertIn("Grafana và Loki", prompt("Sự cố"))
-        self.assertIn("gh", prompt("PR"))
+        self.assertIn("Zenie review qua gh.", prompt("PR"))
         self.assertNotIn("Grafana", prompt("PR"))
         self.assertIn("Plane", prompt("Task"))
         self.assertIn("Plane", prompt("Zenie"))
