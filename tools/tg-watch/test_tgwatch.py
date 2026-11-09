@@ -1,11 +1,15 @@
+import asyncio
 import json
 import os
 import stat
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from tgwatch import Batch, Msg, SourceState, State, ingest, load_config
+from tgwatch import (Batch, Config, Msg, Runner, Source, SourceState, State,
+                     begin_flush, end_flush, in_quiet_hours, ingest, is_due,
+                     load_config, recover_inflight)
 
 
 def msg(i, text="x", edit_date=None):
@@ -97,6 +101,200 @@ class ConfigTest(unittest.TestCase):
             self.assertEqual(cfg.sources[0].topic_id, 6)
             self.assertEqual(cfg.sources[0].bot_id, 9233341253)
             self.assertEqual(cfg.quiet_seconds, 120)
+
+
+UTC7 = timezone(timedelta(hours=7))
+
+
+def at(h, m, s=0, day=9):
+    return datetime(2026, 11, day, h, m, s, tzinfo=UTC7).timestamp()
+
+
+NORMAL = Source(name="Task", bot_id=8836615187)
+URGENT = Source(name="Incident", bot_id=9263592476, urgent=True)
+
+
+def cfg_for(*sources):
+    return Config(enabled=True, sources=list(sources))
+
+
+class ScheduleTest(unittest.TestCase):
+    def test_quiet_window(self):
+        st = SourceState(last_seen=0)
+        run_ingest(st, new=[msg(1)], now=at(10, 0, 0))
+        cfg = cfg_for(NORMAL)
+        self.assertFalse(is_due(st, NORMAL, cfg, at(10, 1, 59)))
+        self.assertTrue(is_due(st, NORMAL, cfg, at(10, 2, 0)))
+
+    def test_max_wait(self):
+        st = SourceState(last_seen=0)
+        start = at(10, 0, 0)
+        for i in range(10):
+            run_ingest(st, new=[msg(i + 1)], now=start + 60 * i)
+        cfg = cfg_for(NORMAL)
+        self.assertFalse(is_due(st, NORMAL, cfg, at(10, 9, 59)))
+        self.assertTrue(is_due(st, NORMAL, cfg, at(10, 10, 0)))
+
+    def test_urgent_at_night(self):
+        st = SourceState(last_seen=0)
+        run_ingest(st, new=[msg(1)], now=at(23, 30, 0))
+        cfg = cfg_for(URGENT)
+        self.assertFalse(is_due(st, URGENT, cfg, at(23, 30, 9)))
+        self.assertTrue(is_due(st, URGENT, cfg, at(23, 30, 10)))
+
+    def test_quiet_hours_hold_until_morning(self):
+        st = SourceState(last_seen=0)
+        run_ingest(st, new=[msg(1)], now=at(23, 30, 0))
+        cfg = cfg_for(NORMAL)
+        self.assertFalse(is_due(st, NORMAL, cfg, at(6, 59, 59, day=10)))
+        self.assertTrue(is_due(st, NORMAL, cfg, at(7, 0, 0, day=10)))
+
+    def test_in_quiet_hours_bounds(self):
+        cfg = cfg_for(NORMAL)
+        self.assertFalse(in_quiet_hours(at(21, 59, 59), cfg))
+        self.assertTrue(in_quiet_hours(at(22, 0, 0), cfg))
+        self.assertTrue(in_quiet_hours(at(0, 0, 0, day=10), cfg))
+        self.assertFalse(in_quiet_hours(at(7, 0, 0, day=10), cfg))
+        cfg.quiet_start, cfg.quiet_end = "12:00", "13:00"
+        self.assertTrue(in_quiet_hours(at(12, 30), cfg))
+        self.assertFalse(in_quiet_hours(at(23, 30), cfg))
+
+    def test_backoff(self):
+        st = SourceState(last_seen=0)
+        run_ingest(st, new=[msg(1)], now=at(10, 0, 0))
+        t = at(10, 2, 0)
+        begin_flush(st)
+        end_flush(st, ok=False, now=t)
+        self.assertIsNone(st.inflight)
+        self.assertEqual(st.pending.next_attempt_at, t + 30)
+        self.assertFalse(is_due(st, NORMAL, cfg_for(NORMAL), t + 29))
+        self.assertTrue(is_due(st, NORMAL, cfg_for(NORMAL), t + 30))
+        t2 = t + 30
+        begin_flush(st)
+        end_flush(st, ok=False, now=t2)
+        self.assertEqual(st.pending.next_attempt_at, t2 + 60)
+        self.assertEqual([m.id for m in st.pending.messages], [1])
+
+    def test_backoff_caps_at_ten_minutes(self):
+        st = SourceState(pending=Batch(messages=[msg(1)], first_at=0.0, last_at=0.0,
+                                       attempts=6))
+        begin_flush(st)
+        end_flush(st, ok=False, now=5000.0)
+        self.assertEqual(st.pending.next_attempt_at, 5600.0)
+
+    def test_failed_flush_goes_before_newer_messages(self):
+        st = SourceState(last_seen=0)
+        run_ingest(st, new=[msg(1)], now=100.0)
+        begin_flush(st)
+        run_ingest(st, new=[msg(2)], now=200.0)
+        end_flush(st, ok=False, now=300.0)
+        self.assertIsNone(st.inflight)
+        self.assertEqual([m.id for m in st.pending.messages], [1, 2])
+        self.assertEqual(st.pending.first_at, 100.0)
+
+    def test_successful_flush_clears_inflight(self):
+        st = SourceState(last_seen=0)
+        run_ingest(st, new=[msg(1)], now=100.0)
+        begin_flush(st)
+        end_flush(st, ok=True, now=300.0)
+        self.assertIsNone(st.inflight)
+        self.assertIsNone(st.pending)
+
+    def test_new_message_during_inflight_goes_to_new_batch(self):
+        st = SourceState(last_seen=0)
+        run_ingest(st, new=[msg(1)], now=100.0)
+        batch = begin_flush(st)
+        run_ingest(st, new=[msg(2)], now=200.0)
+        self.assertEqual([m.id for m in st.pending.messages], [2])
+        self.assertIs(st.inflight, batch)
+        self.assertEqual([m.id for m in st.inflight.messages], [1])
+
+    def test_recover_inflight_marks_resent(self):
+        state = State()
+        state.sources[9233341253] = SourceState(
+            last_seen=1, inflight=Batch(messages=[msg(1)], first_at=1.0, last_at=1.0))
+        recover_inflight(state)
+        st = state.sources[9233341253]
+        self.assertIsNone(st.inflight)
+        self.assertTrue(st.pending.resent)
+        self.assertEqual([m.id for m in st.pending.messages], [1])
+
+
+PR = Source(name="PR", bot_id=9233341253, topic_id=6)
+INCIDENT = Source(name="Incident", bot_id=9263592476, topic_id=7, urgent=True)
+
+
+class RunnerTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_path = Path(self.tmp.name) / "state.json"
+        self.now = at(10, 0, 0)
+
+    async def asyncTearDown(self):
+        self.tmp.cleanup()
+
+    def clock(self):
+        return self.now
+
+    async def test_urgent_not_blocked_by_pending_inject(self):
+        state = State()
+        state.sources[PR.bot_id] = SourceState(
+            last_seen=50,
+            pending=Batch(messages=[msg(50)], first_at=self.now - 300,
+                          last_at=self.now - 300))
+        state.sources[INCIDENT.bot_id] = SourceState(last_seen=0)
+        release_pr = asyncio.Event()
+        injected = []
+
+        async def fetch(src, last_seen):
+            if src.bot_id == INCIDENT.bot_id:
+                return [msg(1)], []
+            return [], []
+
+        async def inject(src, batch):
+            injected.append(src.name)
+            if src.bot_id == PR.bot_id:
+                await release_pr.wait()
+            return True
+
+        runner = Runner(cfg_for(PR, INCIDENT), state, self.state_path, fetch, inject,
+                        self.clock)
+        await runner.tick()
+        await asyncio.sleep(0)
+        self.assertEqual(injected, ["PR"])
+
+        self.now += 10
+        await runner.tick()
+        await asyncio.sleep(0)
+        self.assertEqual(injected, ["PR", "Incident"])
+        self.assertIsNotNone(state.sources[PR.bot_id].inflight)
+        self.assertIsNone(state.sources[INCIDENT.bot_id].inflight)
+
+        release_pr.set()
+        await asyncio.gather(*runner.tasks)
+        self.assertIsNone(state.sources[PR.bot_id].inflight)
+        self.assertIsNone(State.load(self.state_path).sources[PR.bot_id].inflight)
+
+    async def test_inject_failure_requeues_with_backoff(self):
+        state = State()
+        state.sources[PR.bot_id] = SourceState(
+            last_seen=50,
+            pending=Batch(messages=[msg(50)], first_at=self.now - 300,
+                          last_at=self.now - 300))
+
+        async def fetch(src, last_seen):
+            return [], []
+
+        async def inject(src, batch):
+            raise OSError("connection refused")
+
+        runner = Runner(cfg_for(PR), state, self.state_path, fetch, inject, self.clock)
+        await runner.tick()
+        await asyncio.gather(*runner.tasks)
+        st = State.load(self.state_path).sources[PR.bot_id]
+        self.assertIsNone(st.inflight)
+        self.assertEqual([m.id for m in st.pending.messages], [50])
+        self.assertEqual(st.pending.next_attempt_at, self.now + 30)
 
 
 if __name__ == "__main__":

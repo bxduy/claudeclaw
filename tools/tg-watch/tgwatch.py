@@ -1,11 +1,13 @@
-"""tg-watch core: config, persisted state and message ingest (stdlib only)."""
+"""tg-watch core: config, persisted state, ingest, scheduling and runner (stdlib only)."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Awaitable, Callable
 
 
 @dataclass
@@ -187,3 +189,102 @@ def _apply_edit(st: SourceState, m: Msg, now: float) -> None:
 def _trim_edit_dates(st: SourceState, edit_window: int) -> None:
     keep = sorted(st.edit_dates, reverse=True)[:edit_window]
     st.edit_dates = {k: st.edit_dates[k] for k in keep}
+
+
+def _minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def in_quiet_hours(now: float, cfg: Config) -> bool:
+    minute = int((now + cfg.utc_offset_minutes * 60) // 60) % 1440
+    start, end = _minutes(cfg.quiet_start), _minutes(cfg.quiet_end)
+    if start <= end:
+        return start <= minute < end
+    return minute >= start or minute < end
+
+
+def is_due(st: SourceState, src: Source, cfg: Config, now: float) -> bool:
+    b = st.pending
+    if b is None or st.inflight is not None or now < b.next_attempt_at:
+        return False
+    if not src.urgent and in_quiet_hours(now, cfg):
+        return False
+    quiet = cfg.urgent_quiet_seconds if src.urgent else cfg.quiet_seconds
+    return now - b.last_at >= quiet or now - b.first_at >= cfg.max_wait_seconds
+
+
+def begin_flush(st: SourceState) -> Batch:
+    st.inflight, st.pending = st.pending, None
+    return st.inflight
+
+
+def end_flush(st: SourceState, ok: bool, now: float) -> None:
+    if ok:
+        st.inflight = None
+        return
+    b = _requeue_inflight(st)
+    b.attempts += 1
+    b.next_attempt_at = now + min(30 * 2 ** (b.attempts - 1), 600)
+
+
+def recover_inflight(state: State) -> None:
+    for st in state.sources.values():
+        if st.inflight is not None:
+            _requeue_inflight(st).resent = True
+
+
+def _requeue_inflight(st: SourceState) -> Batch:
+    b, p = st.inflight, st.pending
+    st.inflight = None
+    if p is not None:
+        b.messages = b.messages + p.messages
+        b.first_at = min(b.first_at, p.first_at)
+        b.last_at = max(b.last_at, p.last_at)
+        b.overflow = b.overflow or p.overflow
+        b.resent = b.resent or p.resent
+    st.pending = b
+    return b
+
+
+class Runner:
+    def __init__(self, cfg: Config, state: State, state_path: Path,
+                 fetch: Callable[[Source, int | None], Awaitable[tuple[list[Msg], list[Msg]]]],
+                 inject: Callable[[Source, Batch], Awaitable[bool]],
+                 clock: Callable[[], float]) -> None:
+        self.cfg = cfg
+        self.state = state
+        self.state_path = state_path
+        self.fetch = fetch
+        self.inject = inject
+        self.clock = clock
+        self.tasks: set[asyncio.Task] = set()
+
+    def _st(self, src: Source) -> SourceState:
+        return self.state.sources.setdefault(src.bot_id, SourceState())
+
+    async def tick(self) -> None:
+        for src in self.cfg.sources:
+            st = self._st(src)
+            new, recent = await self.fetch(src, st.last_seen)
+            ingest(st, new, recent, self.clock(), self.cfg.catch_up_limit,
+                   self.cfg.edit_window)
+            self.state.save(self.state_path)
+        now = self.clock()
+        for src in self.cfg.sources:
+            st = self._st(src)
+            if not is_due(st, src, self.cfg, now):
+                continue
+            batch = begin_flush(st)
+            self.state.save(self.state_path)
+            task = asyncio.create_task(self._send(src, st, batch))
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+
+    async def _send(self, src: Source, st: SourceState, batch: Batch) -> None:
+        try:
+            ok = await self.inject(src, batch)
+        except Exception:
+            ok = False
+        end_flush(st, ok, self.clock())
+        self.state.save(self.state_path)
