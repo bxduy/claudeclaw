@@ -7,6 +7,7 @@ import json
 import logging
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -39,15 +40,23 @@ def to_msg(m) -> Msg:
     )
 
 
-def post_inject(url: str, token: str, payload: dict, timeout: int) -> str | None:
-    """Return the daemon's reply text on success, None on any not-ok outcome."""
+def post_inject(url: str, token: str, payload: dict, timeout: int) -> tuple[str, bool] | None:
+    """Return (reply text, delivered) on success, None on any not-ok outcome."""
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), method="POST",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = json.loads(resp.read())
-        if resp.status == 200 and body.get("ok") is True and body.get("exitCode") == 0:
-            return str(body.get("result") or "")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read())
+            if resp.status == 200 and body.get("ok") is True and body.get("exitCode") == 0:
+                return str(body.get("result") or ""), body.get("delivered") is True
+            return None
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read()).get("error")
+        except Exception:
+            err = None
+        log.error("inject HTTP %d: %s", e.code, err)
         return None
 
 
@@ -86,19 +95,24 @@ async def amain(args: argparse.Namespace) -> int:
         try:
             port = json.loads((claw / "state.json").read_text())["web"]["port"]
             token = (claw / "web.token").read_text().strip()
-            prompt = build_prompt(src, batch, cfg)
-            reply = await asyncio.to_thread(
+            prompt = build_prompt(src, batch, cfg, (claw / "outbox").resolve())
+            res = await asyncio.to_thread(
                 post_inject, f"http://127.0.0.1:{port}/api/inject", token,
                 inject_payload(prompt, cfg, src), cfg.inject_timeout_seconds)
         except Exception as e:
             log.error("inject failed source=%s attempt=%d: %s", src.name, n, e)
             return False
-        if reply is not None:
-            attempts[src.bot_id] = 0
+        if res is None:
+            log.error("inject failed source=%s attempt=%d: daemon returned not ok", src.name, n)
+            return False
+        reply, delivered = res
+        attempts[src.bot_id] = 0
+        if delivered:
             log.info("flushed source=%s ok %s", src.name, reply[:200].replace("\n", " "))
         else:
-            log.error("inject failed source=%s attempt=%d: daemon returned not ok", src.name, n)
-        return reply is not None
+            # Claude already ran; the log is the digest's only copy, so do not re-run the batch.
+            log.error("flushed source=%s undelivered\n%s", src.name, reply)
+        return True
 
     state_path = claw / "tg-watch-state.json"
     state = State.load(state_path)

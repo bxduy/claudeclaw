@@ -30,7 +30,7 @@ Add to `<claw-dir>/.claude/claudeclaw/settings.json` (ids below are for the "Zen
 
 Optional keys: `pollSeconds` (20), `catchUpLimit` (100), `editWindow` (20), `quietSeconds` (120),
 `urgentQuietSeconds` (10), `maxWaitSeconds` (600), `quietHours` `{start, end}` ("22:00"/"07:00"),
-`utcOffsetMinutes` (420), `injectTimeoutSeconds` (1800). Source names "Sự cố", "PR", "Task",
+`utcOffsetMinutes` (420), `injectTimeoutSeconds` (1900). Source names "Sự cố", "PR", "Task",
 "Zenie" select the read-only lookup hint in the prompt.
 
 ## 3. Install
