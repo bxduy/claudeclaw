@@ -2,3 +2,5 @@
 node_modules
 .codemachine
 AGENTS.md
+# Python bytecode (tools/tg-watch runs under systemd without -B)
+__pycache__/
