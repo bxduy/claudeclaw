@@ -39,13 +39,16 @@ def to_msg(m) -> Msg:
     )
 
 
-def post_inject(url: str, token: str, payload: dict, timeout: int) -> bool:
+def post_inject(url: str, token: str, payload: dict, timeout: int) -> str | None:
+    """Return the daemon's reply text on success, None on any not-ok outcome."""
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), method="POST",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = json.loads(resp.read())
-        return resp.status == 200 and body.get("ok") is True and body.get("exitCode") == 0
+        if resp.status == 200 and body.get("ok") is True and body.get("exitCode") == 0:
+            return str(body.get("result") or "")
+        return None
 
 
 async def amain(args: argparse.Namespace) -> int:
@@ -82,18 +85,18 @@ async def amain(args: argparse.Namespace) -> int:
             port = json.loads((claw / "state.json").read_text())["web"]["port"]
             token = (claw / "web.token").read_text().strip()
             prompt = build_prompt(src, batch, cfg)
-            ok = await asyncio.to_thread(
+            reply = await asyncio.to_thread(
                 post_inject, f"http://127.0.0.1:{port}/api/inject", token,
                 inject_payload(prompt, cfg, src), cfg.inject_timeout_seconds)
         except Exception as e:
             log.error("inject failed source=%s attempt=%d: %s", src.name, n, e)
             return False
-        if ok:
+        if reply is not None:
             attempts[src.bot_id] = 0
-            log.info("flushed source=%s ok %s", src.name, prompt[:200].replace("\n", " "))
+            log.info("flushed source=%s ok %s", src.name, reply[:200].replace("\n", " "))
         else:
             log.error("inject failed source=%s attempt=%d: daemon returned not ok", src.name, n)
-        return ok
+        return reply is not None
 
     state_path = claw / "tg-watch-state.json"
     state = State.load(state_path)

@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import datetime, timedelta, timezone
 from dataclasses import asdict, dataclass, field
@@ -331,6 +332,13 @@ _LOOKUPS = {
 }
 
 
+_WRAPPER_TAG = re.compile(r"<(/?)(untrusted-bot-messages)", re.IGNORECASE)
+
+
+def _defang(text: str) -> str:
+    return _WRAPPER_TAG.sub(r"<\1\2[defanged]", text)
+
+
 def build_prompt(src: Source, batch: Batch, cfg: Config) -> str:
     lookup = _LOOKUPS.get(src.name, "xem log, PR hoặc thẻ Plane liên quan nếu có.")
     parts = [_PROMPT_HEAD.format(name=src.name, lookup=lookup)]
@@ -343,11 +351,11 @@ def build_prompt(src: Source, batch: Batch, cfg: Config) -> str:
     for m in batch.messages:
         when = datetime.fromtimestamp(m.date, tz).strftime("%H:%M %d/%m")
         head = f"[{src.name}] #{m.id} {when}" + (" (đã sửa)" if m.edited else "")
-        block = [head, m.text]
+        block = [head, _defang(m.text)]
         if m.buttons:
-            block.append("Nút: " + " | ".join(m.buttons))
+            block.append("Nút: " + " | ".join(_defang(b) for b in m.buttons))
         if m.urls:
-            block.append("Link: " + " ".join(m.urls))
+            block.append("Link: " + " ".join(_defang(u) for u in m.urls))
         parts.append("\n".join(block) + "\n\n")
     parts.append("</untrusted-bot-messages>")
     return "".join(parts)

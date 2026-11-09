@@ -13,17 +13,17 @@ one topic per bot.
 ## 2. Configure `tgWatch`
 
 Add to `<claw-dir>/.claude/claudeclaw/settings.json` (ids below are for the "Zenie digest" group;
-`botId` is the numeric id of the watched bot, fill in yours):
+`botId` is the numeric id of the watched bot):
 
 ```json
 "tgWatch": {
   "enabled": true,
   "deliverChatId": -1004402543262,
   "sources": [
-    { "name": "Zenie",  "botId": 0, "topicId": 4 },
-    { "name": "Task",   "botId": 0, "topicId": 5 },
-    { "name": "PR",     "botId": 0, "topicId": 6 },
-    { "name": "Sự cố",  "botId": 0, "topicId": 7, "urgent": true }
+    { "name": "Zenie",  "botId": 8954232159, "topicId": 4 },
+    { "name": "Task",   "botId": 8836615187, "topicId": 5 },
+    { "name": "PR",     "botId": 9233341253, "topicId": 6 },
+    { "name": "Sự cố",  "botId": 9263592476, "topicId": 7, "urgent": true }
   ]
 }
 ```
