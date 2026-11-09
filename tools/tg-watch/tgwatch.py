@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
+
+log = logging.getLogger("tg-watch")
 
 
 @dataclass
@@ -266,9 +269,13 @@ class Runner:
     async def tick(self) -> None:
         for src in self.cfg.sources:
             st = self._st(src)
-            new, recent = await self.fetch(src, st.last_seen)
-            ingest(st, new, recent, self.clock(), self.cfg.catch_up_limit,
-                   self.cfg.edit_window)
+            try:
+                new, recent = await self.fetch(src, st.last_seen)
+                ingest(st, new, recent, self.clock(), self.cfg.catch_up_limit,
+                       self.cfg.edit_window)
+            except Exception:
+                log.exception("fetch failed source=%s", src.name)
+                continue
             self.state.save(self.state_path)
         now = self.clock()
         for src in self.cfg.sources:
@@ -285,6 +292,7 @@ class Runner:
         try:
             ok = await self.inject(src, batch)
         except Exception:
+            log.exception("inject failed source=%s", src.name)
             ok = False
         end_flush(st, ok, self.clock())
         self.state.save(self.state_path)

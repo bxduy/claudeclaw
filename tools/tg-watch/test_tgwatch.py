@@ -246,9 +246,11 @@ class RunnerTest(unittest.IsolatedAsyncioTestCase):
         release_pr = asyncio.Event()
         injected = []
 
+        incident_new = [[msg(1)]]
+
         async def fetch(src, last_seen):
-            if src.bot_id == INCIDENT.bot_id:
-                return [msg(1)], []
+            if src.bot_id == INCIDENT.bot_id and incident_new:
+                return incident_new.pop(), []
             return [], []
 
         async def inject(src, batch):
@@ -289,12 +291,44 @@ class RunnerTest(unittest.IsolatedAsyncioTestCase):
             raise OSError("connection refused")
 
         runner = Runner(cfg_for(PR), state, self.state_path, fetch, inject, self.clock)
-        await runner.tick()
-        await asyncio.gather(*runner.tasks)
+        with self.assertLogs("tg-watch", "ERROR") as logs:
+            await runner.tick()
+            await asyncio.gather(*runner.tasks)
+        self.assertIn("inject failed source=PR", logs.output[0])
+        self.assertIn("connection refused", logs.output[0])
         st = State.load(self.state_path).sources[PR.bot_id]
         self.assertIsNone(st.inflight)
         self.assertEqual([m.id for m in st.pending.messages], [50])
         self.assertEqual(st.pending.next_attempt_at, self.now + 30)
+
+    async def test_fetch_failure_does_not_stall_other_sources(self):
+        state = State()
+        state.sources[PR.bot_id] = SourceState(last_seen=50)
+        state.sources[INCIDENT.bot_id] = SourceState(
+            last_seen=0,
+            pending=Batch(messages=[msg(1)], first_at=self.now - 60,
+                          last_at=self.now - 60))
+        fetched = []
+        injected = []
+
+        async def fetch(src, last_seen):
+            fetched.append(src.name)
+            if src.bot_id == PR.bot_id:
+                raise ConnectionError("flood wait")
+            return [], []
+
+        async def inject(src, batch):
+            injected.append((src.name, [m.id for m in batch.messages]))
+            return True
+
+        runner = Runner(cfg_for(PR, INCIDENT), state, self.state_path, fetch, inject,
+                        self.clock)
+        with self.assertLogs("tg-watch", "ERROR") as logs:
+            await runner.tick()
+            await asyncio.gather(*runner.tasks)
+        self.assertIn("fetch failed source=PR", logs.output[0])
+        self.assertEqual(fetched, ["PR", "Incident"])
+        self.assertEqual(injected, [("Incident", [1])])
 
 
 if __name__ == "__main__":
