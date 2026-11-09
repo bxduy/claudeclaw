@@ -177,7 +177,7 @@ def _apply_edit(st: SourceState, m: Msg, now: float) -> None:
     if st.pending is not None:
         for i, p in enumerate(st.pending.messages):
             if p.id == m.id:
-                st.pending.messages[i] = m
+                st.pending.messages[i] = Msg(**{**asdict(m), "edited": p.edited})
                 return
     batch = _ensure_pending(st, now)
     batch.messages.append(Msg(**{**asdict(m), "edited": True}))

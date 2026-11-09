@@ -36,6 +36,13 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(st.pending.messages[0].id, 101)
         self.assertTrue(st.pending.messages[0].edited)
 
+    def test_second_edit_of_pending_copy_keeps_edited_label(self):
+        st = SourceState(last_seen=101, edit_dates={101: 1.0})
+        run_ingest(st, recent=[msg(101, "b", edit_date=2.0)])
+        run_ingest(st, recent=[msg(101, "c", edit_date=3.0)])
+        self.assertEqual([(m.id, m.text, m.edited) for m in st.pending.messages],
+                         [(101, "c", True)])
+
     def test_first_run_sets_baseline_without_batch(self):
         st = SourceState()
         recent = [msg(90, edit_date=5.0)]
