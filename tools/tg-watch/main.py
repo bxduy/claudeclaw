@@ -66,6 +66,8 @@ async def amain(args: argparse.Namespace) -> int:
     if not await client.is_user_authorized():
         log.error("telegram session is not authorized; re-login tg-user")
         return 1
+    # A StringSession carries no entity cache; load dialogs so bot ids resolve to input peers.
+    await client.get_dialogs()
 
     async def fetch(src: Source, last_seen: int | None):
         new: list[Msg] = []
