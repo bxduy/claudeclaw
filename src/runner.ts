@@ -631,10 +631,13 @@ export const TASK_SYSTEM_PROMPT =
 /** Extra deny-list for task runs: merging is the user's decision, never a task's. */
 export const TASK_DISALLOWED_TOOLS = ["Bash(gh pr merge:*)"];
 
-/** Deny-list for tg-watch topic injects: a digest only reads, never edits, posts as the user or ships. */
+/**
+ * Deny-list for tg-watch topic injects: a digest never edits code, posts as the user or ships.
+ * Write stays allowed so a long digest can go to the outbox as a [send-file:]; delivery only
+ * uploads files under the outbox.
+ */
 export const INJECT_DISALLOWED_TOOLS = [
   "Edit",
-  "Write",
   "NotebookEdit",
   "mcp__telegram",
   "Bash(git push:*)",
@@ -2006,9 +2009,16 @@ export async function runUserMessage(
   return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, undefined, agentName, undefined, onChunk, onToolEvent);
 }
 
-/** tg-watch topic inject: job timeout and INJECT_DISALLOWED_TOOLS on top of settings.security. */
+/**
+ * Per-attempt timeout for a tg-watch inject. A timed-out resumed run is compacted and retried
+ * with the same timeout, so the worst case is about 3x this; it must stay under tg-watch's
+ * injectTimeoutSeconds (1900s) or the client re-sends a batch the daemon still delivers.
+ */
+export const INJECT_TIMEOUT_MS = 9 * 60_000;
+
+/** tg-watch topic inject: INJECT_TIMEOUT_MS and INJECT_DISALLOWED_TOOLS on top of settings.security. */
 export async function runInjectMessage(prompt: string, sessionKey: string): Promise<RunResult> {
-  return run("inject", prefixUserMessageWithClock(prompt), sessionKey, undefined, undefined, undefined, "job", undefined, undefined, INJECT_DISALLOWED_TOOLS);
+  return run("inject", prefixUserMessageWithClock(prompt), sessionKey, undefined, INJECT_TIMEOUT_MS, undefined, undefined, undefined, undefined, INJECT_DISALLOWED_TOOLS);
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project

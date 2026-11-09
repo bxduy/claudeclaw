@@ -5,6 +5,7 @@ import { join } from "path";
 import {
   appendEventLine,
   INJECT_DISALLOWED_TOOLS,
+  INJECT_TIMEOUT_MS,
   isRateLimited,
   killTaskProcesses,
   runTaskClaude,
@@ -93,9 +94,14 @@ describe("withExtraDisallowedTools", () => {
     expect(merged.disallowedTools).toEqual(["WebSearch", ...INJECT_DISALLOWED_TOOLS]);
     expect(merged.allowedTools).toEqual(["Read"]);
     expect(security.disallowedTools).toEqual(["WebSearch"]);
-    for (const t of ["Edit", "Write", "NotebookEdit", "mcp__telegram", "Bash(git push:*)", "Bash(git commit:*)", "Bash(gh pr merge:*)"]) {
+    for (const t of ["Edit", "NotebookEdit", "mcp__telegram", "Bash(git push:*)", "Bash(git commit:*)", "Bash(gh pr merge:*)"]) {
       expect(INJECT_DISALLOWED_TOOLS).toContain(t);
     }
+  });
+
+  test("inject timeout x3 (run, compact, retry) stays under tg-watch's 1900s client timeout", () => {
+    expect(3 * INJECT_TIMEOUT_MS).toBeLessThan(1900 * 1000);
+    expect(INJECT_DISALLOWED_TOOLS).not.toContain("Write");
   });
 
   test("no extras leaves security unchanged", () => {
