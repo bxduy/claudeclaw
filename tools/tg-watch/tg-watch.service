@@ -1,0 +1,11 @@
+[Unit]
+Description=tg-watch: digest Telegram bot chats via ClaudeClaw
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/share/tg-user/venv/bin/python -I %h/Desktop/repos/claudeclaw/tools/tg-watch/main.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

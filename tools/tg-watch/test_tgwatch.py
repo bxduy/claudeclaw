@@ -9,7 +9,7 @@ from pathlib import Path
 
 from tgwatch import (Batch, Config, Msg, Runner, Source, SourceState, State,
                      begin_flush, end_flush, in_quiet_hours, ingest, is_due,
-                     load_config, recover_inflight)
+                     build_prompt, inject_payload, load_config, recover_inflight)
 
 
 def msg(i, text="x", edit_date=None):
@@ -333,3 +333,29 @@ class RunnerTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromptTest(unittest.TestCase):
+    def test_prompt_contains_rules_and_wrapped_messages(self):
+        src = Source(name="Plane bot", bot_id=1, topic_id=5)
+        m = Msg(id=42, date=0.0, edit_date=None, text="Task PLN-1 da xong",
+                buttons=["Mở Plane"], urls=["https://plane.zenify.vn/x"])
+        batch = Batch(messages=[m], first_at=0.0, last_at=0.0, overflow=True)
+        p = build_prompt(src, batch, Config(enabled=True, sources=[src]))
+        start, end = p.index("<untrusted-bot-messages>"), p.index("</untrusted-bot-messages>")
+        self.assertLess(start, p.index("Task PLN-1 da xong"))
+        self.assertLess(p.index("Task PLN-1 da xong"), end)
+        for needle in ["Nút: Mở Plane", "https://plane.zenify.vn/x", "tiếng Việt",
+                       "chỉ đọc", "Đề xuất bước tiếp", "press_inline_button", "/znf:",
+                       "có thể còn tin cũ hơn chưa đọc", "[Plane bot] #42 07:00 01/01"]:
+            self.assertIn(needle, p)
+        self.assertNotIn("đã sửa", p)
+        self.assertNotIn("tg-watch khởi động lại", p)
+
+    def test_payload_without_group_is_dm(self):
+        src = Source(name="b", bot_id=1, topic_id=6)
+        cfg = Config(enabled=True, sources=[src])
+        self.assertEqual(inject_payload("p", cfg, src), {"message": "p"})
+        cfg.deliver_chat_id = -1001
+        self.assertEqual(inject_payload("p", cfg, src),
+                         {"message": "p", "chatId": -1001, "threadId": 6})
