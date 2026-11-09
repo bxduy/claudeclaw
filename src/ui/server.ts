@@ -8,8 +8,11 @@ import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 import { listSessions, readSessionMessages, listAgents } from "./services/sessions";
 import { getSessionUsage } from "./services/usage";
-import { runUserMessage } from "../runner";
+import { runInjectMessage, runUserMessage } from "../runner";
+import { HEARTBEAT_DIR } from "../config";
+import { handleInject } from "./inject";
 import { tmpdir } from "os";
+import { join } from "path";
 import { randomUUID } from "crypto";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
@@ -241,20 +244,22 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       if (url.pathname === "/api/inject" && req.method === "POST") {
         try {
           const body = await req.json();
-          const message = typeof body.message === "string" ? body.message.trim() : "";
-          if (!message) return json({ ok: false, error: "message is required" }, 400);
-          const result = await runUserMessage("inject", message);
-          const text = result.stdout.trim();
           const { telegram } = opts.getSnapshot().settings;
-          if (text && telegram.token && telegram.allowedUserIds.length > 0) {
-            const chatId = telegram.allowedUserIds[0];
-            fetch(`https://api.telegram.org/bot${telegram.token}/sendMessage`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ chat_id: chatId, text }),
-            }).catch(() => {});
-          }
-          return json({ ok: true, result: result.stdout, exitCode: result.exitCode });
+          const token = telegram.token;
+          const res = await handleInject(body, {
+            run: (m, k) => (k ? runInjectMessage(m, k) : runUserMessage("inject", m)),
+            deliver: token
+              ? async (chatId, text, threadId) => {
+                  const { deliverTelegramText } = await import("../commands/telegram");
+                  const { mkdir } = await import("fs/promises");
+                  const outbox = join(HEARTBEAT_DIR, "outbox");
+                  await mkdir(outbox, { recursive: true });
+                  await deliverTelegramText(token, chatId, text, threadId, outbox);
+                }
+              : undefined,
+            defaultChatId: telegram.allowedUserIds[0],
+          });
+          return json(res.body, res.status);
         } catch (err) {
           return json({ ok: false, error: String(err) }, 500);
         }

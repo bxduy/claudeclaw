@@ -8,7 +8,7 @@ import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { findSessionJsonlPath } from "../sessionFiles";
 import { resolveSkillPrompt, listSkills } from "../skills";
 import { mkdir } from "node:fs/promises";
@@ -523,6 +523,47 @@ async function sendDocumentToChat(
     const body = await res.text();
     throw new Error(`Telegram sendDocument failed: ${res.status} ${body}`);
   }
+}
+
+/**
+ * Deliver agent output to a chat: strips [send-file:] and [react:] tags, sends the
+ * remaining text (chunked by sendMessage), then each file. A failing step does not
+ * stop the later ones; the first error is rethrown at the end.
+ */
+async function deliverTelegramText(
+  token: string,
+  chatId: number,
+  text: string,
+  threadId?: number,
+  fileRoot?: string
+): Promise<void> {
+  const { cleanedText, filePaths } = extractSendFileDirectives(text);
+  const body = cleanedText.replace(/\[react:[^\]\r\n]+\]/gi, "").trim();
+  let firstError: unknown;
+  const attempt = async (fn: () => Promise<void>) => {
+    try {
+      await fn();
+    } catch (err) {
+      firstError ??= err;
+    }
+  };
+  if (body) await attempt(() => sendMessage(token, chatId, body, threadId));
+  const root = fileRoot ? (await realpath(fileRoot)) + "/" : undefined;
+  for (const filePath of filePaths) {
+    await attempt(async () => {
+      const resolved = await realpath(filePath).catch(() => undefined);
+      if (resolved === undefined) {
+        console.error(`[Telegram] send-file missing: ${filePath}`);
+        throw new Error(`send-file missing: ${filePath}`);
+      }
+      if (root && !resolved.startsWith(root)) {
+        console.error(`[Telegram] send-file outside outbox: ${filePath}`);
+        throw new Error(`send-file outside outbox: ${filePath}`);
+      }
+      await sendDocumentToChat(token, chatId, resolved, threadId);
+    });
+  }
+  if (firstError !== undefined) throw firstError;
 }
 
 // Chat IDs with verbose tool display enabled
@@ -1935,7 +1976,7 @@ async function poll(generation: number): Promise<void> {
 // --- Exports ---
 
 /** Send a message to a specific chat (used by heartbeat forwarding) */
-export { sendMessage };
+export { sendMessage, deliverTelegramText };
 
 process.on("SIGTERM", () => { running = false; });
 process.on("SIGINT", () => { running = false; });

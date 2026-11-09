@@ -631,6 +631,26 @@ export const TASK_SYSTEM_PROMPT =
 /** Extra deny-list for task runs: merging is the user's decision, never a task's. */
 export const TASK_DISALLOWED_TOOLS = ["Bash(gh pr merge:*)"];
 
+/**
+ * Deny-list for tg-watch topic injects: a digest never edits code, posts as the user or ships.
+ * Write stays allowed so a long digest can go to the outbox as a [send-file:]; delivery only
+ * uploads files under the outbox.
+ */
+export const INJECT_DISALLOWED_TOOLS = [
+  "Edit",
+  "NotebookEdit",
+  "mcp__telegram",
+  "Bash(git push:*)",
+  "Bash(git commit:*)",
+  "Bash(gh pr merge:*)",
+];
+
+/** Return security with extra tools appended to its deny-list (unchanged when there are none). */
+export function withExtraDisallowedTools(security: SecurityConfig, extra?: string[]): SecurityConfig {
+  if (!extra?.length) return security;
+  return { ...security, disallowedTools: [...security.disallowedTools, ...extra] };
+}
+
 const TASK_KILL_GRACE_MS = 5000;
 // After exit, how long to wait for stdout/stderr to close. A process that left the
 // group (setsid) can hold the pipes open indefinitely.
@@ -1339,7 +1359,8 @@ async function execClaude(
   agentName?: string,
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  extraDisallowedTools?: string[]
 ): Promise<RunResult> {
   mainRunCount++;
   persistRunCount();
@@ -1394,7 +1415,7 @@ async function execClaude(
     model: fallback?.model ?? "",
     api: fallback?.api ?? "",
   };
-  const securityArgs = buildSecurityArgs(security);
+  const securityArgs = buildSecurityArgs(withExtraDisallowedTools(security, extraDisallowedTools));
   const timeoutMs = timeoutMsOverride ?? resolveTimeoutMs(timeoutCategory ?? name);
 
   console.log(
@@ -1745,9 +1766,10 @@ export async function run(
   agentName?: string,
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  extraDisallowedTools?: string[]
 ): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory, onChunk, onToolEvent), threadId);
+  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory, onChunk, onToolEvent, extraDisallowedTools), threadId);
 }
 
 async function streamClaude(
@@ -1985,6 +2007,18 @@ export async function runUserMessage(
   modelOverride?: string
 ): Promise<RunResult> {
   return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, undefined, agentName, undefined, onChunk, onToolEvent);
+}
+
+/**
+ * Per-attempt timeout for a tg-watch inject. A timed-out resumed run is compacted and retried
+ * with the same timeout, so the worst case is about 3x this; it must stay under tg-watch's
+ * injectTimeoutSeconds (1900s) or the client re-sends a batch the daemon still delivers.
+ */
+export const INJECT_TIMEOUT_MS = 9 * 60_000;
+
+/** tg-watch topic inject: INJECT_TIMEOUT_MS and INJECT_DISALLOWED_TOOLS on top of settings.security. */
+export async function runInjectMessage(prompt: string, sessionKey: string): Promise<RunResult> {
+  return run("inject", prefixUserMessageWithClock(prompt), sessionKey, undefined, INJECT_TIMEOUT_MS, undefined, undefined, undefined, undefined, INJECT_DISALLOWED_TOOLS);
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project
