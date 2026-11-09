@@ -525,6 +525,34 @@ async function sendDocumentToChat(
   }
 }
 
+/**
+ * Deliver agent output to a chat: strips [send-file:] and [react:] tags, sends the
+ * remaining text (chunked by sendMessage), then each file. A failing step does not
+ * stop the later ones; the first error is rethrown at the end.
+ */
+async function deliverTelegramText(
+  token: string,
+  chatId: number,
+  text: string,
+  threadId?: number
+): Promise<void> {
+  const { cleanedText, filePaths } = extractSendFileDirectives(text);
+  const body = cleanedText.replace(/\[react:[^\]\r\n]+\]/gi, "").trim();
+  let firstError: unknown;
+  const attempt = async (fn: () => Promise<void>) => {
+    try {
+      await fn();
+    } catch (err) {
+      firstError ??= err;
+    }
+  };
+  if (body) await attempt(() => sendMessage(token, chatId, body, threadId));
+  for (const filePath of filePaths) {
+    await attempt(() => sendDocumentToChat(token, chatId, filePath, threadId));
+  }
+  if (firstError !== undefined) throw firstError;
+}
+
 // Chat IDs with verbose tool display enabled
 const verboseChats = new Set<number>();
 
@@ -1935,7 +1963,7 @@ async function poll(generation: number): Promise<void> {
 // --- Exports ---
 
 /** Send a message to a specific chat (used by heartbeat forwarding) */
-export { sendMessage };
+export { sendMessage, deliverTelegramText };
 
 process.on("SIGTERM", () => { running = false; });
 process.on("SIGINT", () => { running = false; });
