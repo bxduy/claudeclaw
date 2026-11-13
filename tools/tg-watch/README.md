@@ -23,7 +23,8 @@ Add to `<claw-dir>/.claude/claudeclaw/settings.json` (ids below are for the "Zen
     { "name": "Zenie",  "botId": 8954232159, "topicId": 4 },
     { "name": "Task",   "botId": 8836615187, "topicId": 5 },
     { "name": "PR",     "botId": 9233341253, "topicId": 6 },
-    { "name": "Sự cố",  "botId": 9263592476, "topicId": 7, "urgent": true }
+    { "name": "Sự cố",  "botId": 9263592476, "topicId": 7, "urgent": true },
+    { "name": "Platform", "botId": -5187798725, "topicId": 130 }
   ]
 }
 ```
@@ -31,7 +32,8 @@ Add to `<claw-dir>/.claude/claudeclaw/settings.json` (ids below are for the "Zen
 Optional keys: `pollSeconds` (20), `catchUpLimit` (100), `editWindow` (20), `quietSeconds` (120),
 `urgentQuietSeconds` (10), `maxWaitSeconds` (600), `quietHours` `{start, end}` ("22:00"/"07:00"),
 `utcOffsetMinutes` (420), `injectTimeoutSeconds` (1900). Source names "Sự cố", "PR", "Task",
-"Zenie" select the read-only lookup hint in the prompt.
+"Zenie", "Platform" select the read-only lookup hint in the prompt. `botId` may also be a group id
+(negative), e.g. "Zenify Platform Notifications" for "Platform".
 
 ## 3. Install
 
