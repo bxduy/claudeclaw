@@ -332,6 +332,10 @@ _LOOKUPS = {
     "PR": "xem PR, CI và điểm Zenie review qua gh.",
     "Task": "xem thẻ Plane liên quan.",
     "Zenie": "xem thẻ Plane liên quan.",
+    "Platform": ("đây là cảnh báo lỗi của zenify_devops_bot. Gộp theo tài khoản, API và mã lỗi; "
+                 "với mỗi nhóm, trace log Grafana (Loki/Tempo, prd) quanh thời điểm cảnh báo và "
+                 "kết luận do đâu: lỗi tạm phía Zalo, do khách/dữ liệu, tài khoản mất phiên, hay "
+                 "bug của mình (nêu repo và file:line). Không nhắc lại số điện thoại."),
 }
 
 

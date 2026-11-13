@@ -421,6 +421,8 @@ class PromptTest(unittest.TestCase):
         self.assertNotIn("Grafana", prompt("PR"))
         self.assertIn("Plane", prompt("Task"))
         self.assertIn("Plane", prompt("Zenie"))
+        self.assertIn("trace log Grafana", prompt("Platform"))
+        self.assertIn("Không nhắc lại số điện thoại", prompt("Platform"))
 
 
 if __name__ == "__main__":
