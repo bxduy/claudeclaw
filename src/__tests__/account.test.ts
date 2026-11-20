@@ -8,22 +8,22 @@ mock.module("../config", () => ({
   getSettings: () => ({ fallback: { model: "", api: "", oauthTokenFile: tokenFile } }),
 }));
 
-const { applyAccountEnv, isOnFallbackAccount, resetAccountState, switchToFallbackAccount } = await import("../account");
+const { applyAccountEnv, fallbackAccountAfterLimit, isOnFallbackAccount, primaryAccountResetAt, resetAccountState, switchToFallbackAccount } = await import("../account");
 
 const dir = mkdtempSync(join(tmpdir(), "claudeclaw-account-"));
 const validFile = join(dir, "account2.token");
 writeFileSync(validFile, "  oat-test-token\n");
+
+afterAll(() => {
+  setSystemTime();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 describe("fallback account", () => {
   beforeEach(() => {
     setSystemTime();
     resetAccountState();
     tokenFile = validFile;
-  });
-
-  afterAll(() => {
-    setSystemTime();
-    rmSync(dir, { recursive: true, force: true });
   });
 
   test("without a token file there is nothing to switch to", () => {
@@ -74,5 +74,35 @@ describe("fallback account", () => {
   test("expands ~ in the token file path", () => {
     tokenFile = "~/definitely-not-a-claudeclaw-token-file";
     expect(switchToFallbackAccount(null)).toBe(false);
+  });
+});
+
+describe("fallbackAccountAfterLimit", () => {
+  beforeEach(() => {
+    setSystemTime();
+    resetAccountState();
+    tokenFile = validFile;
+  });
+
+  test("switches when a primary spawn hits the limit", () => {
+    expect(fallbackAccountAfterLimit(null, false)).toBe(true);
+    expect(isOnFallbackAccount()).toBe(true);
+  });
+
+  test("a primary spawn that overlapped another run's switch still goes to the fallback", () => {
+    expect(fallbackAccountAfterLimit(null, false)).toBe(true);
+    expect(fallbackAccountAfterLimit(null, false)).toBe(true);
+  });
+
+  test("a spawn that already ran on the fallback account means both are limited", () => {
+    expect(fallbackAccountAfterLimit(null, false)).toBe(true);
+    expect(fallbackAccountAfterLimit(null, true)).toBe(false);
+  });
+
+  test("primaryAccountResetAt is the primary reset only while on the fallback", () => {
+    expect(primaryAccountResetAt()).toBe(0);
+    const reset = Date.now() + 60_000;
+    fallbackAccountAfterLimit(reset, false);
+    expect(primaryAccountResetAt()).toBe(reset);
   });
 });

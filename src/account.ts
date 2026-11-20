@@ -58,6 +58,23 @@ export function switchToFallbackAccount(resetAt: number | null): boolean {
   return true;
 }
 
+/**
+ * A spawn hit the usage limit. Returns true when later attempts should run on
+ * the fallback account: switches now, or another run already switched while
+ * this spawn was still on the primary account. False when the spawn itself ran
+ * on the fallback account (both accounts limited) or there is no fallback.
+ */
+export function fallbackAccountAfterLimit(resetAt: number | null, spawnedOnFallback: boolean): boolean {
+  if (spawnedOnFallback) return false;
+  if (isOnFallbackAccount()) return true;
+  return switchToFallbackAccount(resetAt);
+}
+
+/** Primary account reset time while running on the fallback account, else 0. */
+export function primaryAccountResetAt(): number {
+  return isOnFallbackAccount() ? primaryLimitedUntil : 0;
+}
+
 /** Put the active account's credentials into a spawn env (mutates and returns it). */
 export function applyAccountEnv(env: Record<string, string>): Record<string, string> {
   if (!isOnFallbackAccount()) return env;
