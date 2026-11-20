@@ -247,6 +247,8 @@ export interface AgenticConfig {
 export interface ModelConfig {
   model: string;
   api: string;
+  /** fallback only: OAuth token file of a second Claude account, used while the primary account is rate limited. */
+  oauthTokenFile?: string;
 }
 
 export interface WebConfig {
@@ -366,6 +368,7 @@ function parseSettings(
     fallback: {
       model: typeof raw.fallback?.model === "string" ? raw.fallback.model.trim() : "",
       api: typeof raw.fallback?.api === "string" ? raw.fallback.api.trim() : "",
+      oauthTokenFile: typeof raw.fallback?.oauthTokenFile === "string" ? raw.fallback.oauthTokenFile.trim() : "",
     },
     agentic: parseAgenticConfig(raw.agentic),
     timezone: parsedTimezone,

@@ -29,6 +29,7 @@ import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
+import { applyAccountEnv, fallbackAccountAfterLimit, primaryAccountResetAt } from "./account";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
@@ -115,7 +116,8 @@ function cleanSpawnEnv(): Record<string, string> {
     if (stripped.has(key)) continue;
     if (typeof value === "string") out[key] = value;
   }
-  return out;
+  // Re-add CLAUDE_CODE_OAUTH_TOKEN only from settings.fallback.oauthTokenFile, while the primary account is rate limited.
+  return applyAccountEnv(out);
 }
 
 export type CompactEvent =
@@ -188,6 +190,17 @@ function stripResume(args: string[]): string[] {
   return out;
 }
 
+const ACCOUNT_SWITCH_NOTE =
+  "[ClaudeClaw: the previous attempt at this message stopped at a usage limit and is being retried on another Claude account. If you already started on it in this session, continue from where you stopped instead of starting over.]\n\n";
+
+/** Replace the `-p` prompt argument. */
+function withPrompt(args: string[], prompt: string): string[] {
+  const out = [...args];
+  const idx = out.indexOf("-p");
+  if (idx !== -1 && idx + 1 < out.length) out[idx + 1] = prompt;
+  return out;
+}
+
 /** Replace the value following --output-format (returns a modified copy). */
 function withOutputFormat(args: string[], format: string): string[] {
   const out = [...args];
@@ -246,6 +259,9 @@ export function markRateLimitNotified(): void {
 export function noteRateLimit(message: string): void {
   const resetTime = parseRateLimitResetTime(message);
   rateLimitResetAt = resetTime ?? (Date.now() + 60 * 60_000);
+  // Both accounts limited: resume as soon as the primary account resets, even if the fallback resets later.
+  const primaryBack = primaryAccountResetAt();
+  if (primaryBack && primaryBack < rateLimitResetAt) rateLimitResetAt = primaryBack;
   rateLimitNotified = false;
   console.warn(
     `[${new Date().toLocaleTimeString()}] Rate limit detected. Reset at: ${new Date(rateLimitResetAt).toISOString()}`
@@ -768,13 +784,14 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
+  const taskBaseEnv = cleanSpawnEnv();
   // detached: the child leads a new process group (pgid === pid), so -pid reaches its descendants.
   const proc = Bun.spawn(args, {
     cwd: opts.cwd,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...buildChildEnv(cleanSpawnEnv(), model, api), [TASK_SESSION_ENV]: opts.sessionId },
+    env: { ...buildChildEnv(taskBaseEnv, model, api), [TASK_SESSION_ENV]: opts.sessionId },
     detached: true,
   });
   const pgid = proc.pid;
@@ -917,7 +934,9 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
     const rateLimitMessage = extractRateLimitMessage(result, stderr);
     if (rateLimitMessage) {
       reason = "rate_limit";
-      noteRateLimit(rateLimitMessage);
+      // With a fallback account to switch to, later spawns keep running; only pause when there is none.
+      const spawnedOnFallback = Boolean(taskBaseEnv.CLAUDE_CODE_OAUTH_TOKEN);
+      if (!fallbackAccountAfterLimit(parseRateLimitResetTime(rateLimitMessage), spawnedOnFallback)) noteRateLimit(rateLimitMessage);
     }
   }
 
@@ -1470,12 +1489,26 @@ async function execClaude(
     args.push("--append-system-prompt", appendParts.join("\n\n"));
   }
 
-  const baseEnv = cleanSpawnEnv();
+  let baseEnv = cleanSpawnEnv();
   const spawnCwd = agentName ? await ensureAgentDir(agentName) : undefined;
 
   let exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
-  const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+  let primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
+
+  // Primary account hit its limit: rerun the same session on the fallback account.
+  // cleanSpawnEnv() strips any inherited token, so a token here means this spawn already ran on the fallback account.
+  const spawnedOnFallback = Boolean(baseEnv.CLAUDE_CODE_OAUTH_TOKEN);
+  if (primaryRateLimit && fallbackAccountAfterLimit(parseRateLimitResetTime(primaryRateLimit), spawnedOnFallback)) {
+    baseEnv = cleanSpawnEnv();
+    const accountArgs = withPrompt(args, ACCOUNT_SWITCH_NOTE + prompt);
+    exec = await runClaudeStream(accountArgs, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
+    primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+  }
+
+  // The model fallback may point at a third-party endpoint: never hand it the Claude OAuth token.
+  const modelFallbackEnv = { ...baseEnv };
+  delete modelFallbackEnv.CLAUDE_CODE_OAUTH_TOKEN;
 
   if (primaryRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
     console.warn(
@@ -1489,7 +1522,7 @@ async function execClaude(
     if (appendParts.length > 0) {
       fallbackArgs.push("--append-system-prompt", appendParts.join("\n\n"));
     }
-    exec = await runClaudeStream(fallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
+    exec = await runClaudeStream(fallbackArgs, fallbackConfig.model, fallbackConfig.api, modelFallbackEnv, timeoutMs, spawnCwd);
     usedFallback = true;
     let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
 
@@ -1501,7 +1534,7 @@ async function execClaude(
         `[${new Date().toLocaleTimeString()}] Detected corrupted fallback session (thinking block signature mismatch). Reset${flabel}, retrying fallback fresh...`
       );
       const freshFallbackArgs = fallbackArgs.filter((a) => a !== "--resume" && a !== fallbackSession.sessionId);
-      exec = await runClaudeStream(freshFallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
+      exec = await runClaudeStream(freshFallbackArgs, fallbackConfig.model, fallbackConfig.api, modelFallbackEnv, timeoutMs, spawnCwd);
       fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
       if (!fallbackRateLimit && exec.sessionId) {
         await createFallbackSession(exec.sessionId, agentName, threadId);
@@ -1595,7 +1628,7 @@ async function execClaude(
       retryArgs,
       retryConfig.model,
       retryConfig.api,
-      baseEnv,
+      usedFallback ? modelFallbackEnv : baseEnv,
       timeoutMs,
       spawnCwd
     );
