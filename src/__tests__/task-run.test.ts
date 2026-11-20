@@ -418,6 +418,17 @@ describe("runTaskClaude", () => {
     expect(res.reason).toBe("rate_limit");
   });
 
+  test("weekly limit message is a rate limit", async () => {
+    const exe = fakeClaude([
+      "cat <<'EOF'",
+      `{"type":"result","is_error":true,"result":"You've hit your weekly limit · resets 1pm (Asia/Ho_Chi_Minh)"}`,
+      "EOF",
+      "exit 1",
+    ].join("\n"));
+    const res = await runTaskClaude(opts(exe));
+    expect(res.reason).toBe("rate_limit");
+  });
+
   // Keep last: rate-limit state is a module-level global that cannot be reset.
   test("rate limit", async () => {
     const exe = fakeClaude([
