@@ -163,8 +163,10 @@ export interface AgentStreamEvent {
   result?: string;
 }
 
-const RATE_LIMIT_PATTERN = /you(?:'|')ve hit your limit|out of extra usage/i;
-const RATE_LIMIT_RESET_PATTERN = /resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?\s*UTC\s*\)?/i;
+// Matches "hit your limit" and qualified variants such as "hit your weekly limit".
+const RATE_LIMIT_PATTERN = /you(?:'|’)ve hit your (?:[\w-]+ ){0,2}limit|out of extra usage/i;
+// The reset zone is "UTC" or an IANA name, e.g. "resets 1pm (Asia/Ho_Chi_Minh)".
+const RATE_LIMIT_RESET_PATTERN = /resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?\s*(UTC|[A-Za-z_]+(?:\/[A-Za-z0-9_+-]+)+)\s*\)?/i;
 const SIGNATURE_ERROR = /Invalid.*signature.*thinking block/i;
 
 // Claude Code prints this when --resume references a session it no longer
@@ -213,7 +215,24 @@ function withOutputFormat(args: string[], format: string): string[] {
 let rateLimitResetAt: number = 0; // epoch ms; 0 = not rate-limited
 let rateLimitNotified: boolean = false;
 
-function parseRateLimitResetTime(text: string): number | null {
+/** Minutes `timeZone` is ahead of UTC at `at`; null for an unknown zone. */
+function zoneOffsetMinutes(timeZone: string, at: Date): number | null {
+  if (timeZone.toUpperCase() === "UTC") return 0;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric",
+      hour: "numeric", minute: "numeric", second: "numeric",
+    }).formatToParts(at);
+    const get = (type: string) => Number(parts.find((p) => p.type === type)?.value);
+    const wallAsUtc = Date.UTC(get("year"), get("month") - 1, get("day"), get("hour"), get("minute"), get("second"));
+    return Math.round((wallAsUtc - Math.floor(at.getTime() / 1000) * 1000) / 60_000);
+  } catch {
+    return null;
+  }
+}
+
+/** Next occurrence of the reset wall-clock time in the stated zone (epoch ms), or null. */
+export function parseRateLimitResetTime(text: string, now: Date = new Date()): number | null {
   const match = text.match(RATE_LIMIT_RESET_PATTERN);
   if (!match) return null;
 
@@ -224,13 +243,16 @@ function parseRateLimitResetTime(text: string): number | null {
   if (ampm === "pm" && hours < 12) hours += 12;
   if (ampm === "am" && hours === 12) hours = 0;
 
-  const now = new Date();
-  const reset = new Date(now);
-  reset.setUTCHours(hours, minutes, 0, 0);
-  if (reset.getTime() <= now.getTime()) {
-    reset.setUTCDate(reset.getUTCDate() + 1);
+  const offsetMs = (zoneOffsetMinutes(match[4]!, now) ?? NaN) * 60_000;
+  if (Number.isNaN(offsetMs)) return null;
+
+  // Work on the zone's wall clock expressed as UTC, then shift back.
+  const wall = new Date(now.getTime() + offsetMs);
+  wall.setUTCHours(hours, minutes, 0, 0);
+  if (wall.getTime() <= now.getTime() + offsetMs) {
+    wall.setUTCDate(wall.getUTCDate() + 1);
   }
-  return reset.getTime();
+  return wall.getTime() - offsetMs;
 }
 
 export function isRateLimited(): boolean {
@@ -348,6 +370,11 @@ function extractRateLimitMessage(stdout: string, stderr: string): string | null 
     if (trimmed && RATE_LIMIT_PATTERN.test(trimmed)) return trimmed;
   }
   return null;
+}
+
+/** Limit message of a failed spawn; a successful reply may merely quote the phrase. */
+function failedRunLimitMessage(exec: { rawStdout: string; stderr: string; exitCode: number }): string | null {
+  return exec.exitCode !== 0 ? extractRateLimitMessage(exec.rawStdout, exec.stderr) : null;
 }
 
 function sameModelConfig(a: ModelConfig, b: ModelConfig): boolean {
@@ -1493,7 +1520,7 @@ async function execClaude(
   const spawnCwd = agentName ? await ensureAgentDir(agentName) : undefined;
 
   let exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
-  let primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+  let primaryRateLimit = failedRunLimitMessage(exec);
   let usedFallback = false;
 
   // Primary account hit its limit: rerun the same session on the fallback account.
@@ -1503,7 +1530,7 @@ async function execClaude(
     baseEnv = cleanSpawnEnv();
     const accountArgs = withPrompt(args, ACCOUNT_SWITCH_NOTE + prompt);
     exec = await runClaudeStream(accountArgs, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
-    primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+    primaryRateLimit = failedRunLimitMessage(exec);
   }
 
   // The model fallback may point at a third-party endpoint: never hand it the Claude OAuth token.
@@ -1524,7 +1551,7 @@ async function execClaude(
     }
     exec = await runClaudeStream(fallbackArgs, fallbackConfig.model, fallbackConfig.api, modelFallbackEnv, timeoutMs, spawnCwd);
     usedFallback = true;
-    let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+    let fallbackRateLimit = failedRunLimitMessage(exec);
 
     // If the fallback resumed a corrupted session, reset it and retry fresh.
     if (!fallbackRateLimit && fallbackSession && exec.exitCode !== 0 && SIGNATURE_ERROR.test(exec.rawStdout + exec.stderr)) {
@@ -1535,7 +1562,7 @@ async function execClaude(
       );
       const freshFallbackArgs = fallbackArgs.filter((a) => a !== "--resume" && a !== fallbackSession.sessionId);
       exec = await runClaudeStream(freshFallbackArgs, fallbackConfig.model, fallbackConfig.api, modelFallbackEnv, timeoutMs, spawnCwd);
-      fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+      fallbackRateLimit = failedRunLimitMessage(exec);
       if (!fallbackRateLimit && exec.sessionId) {
         await createFallbackSession(exec.sessionId, agentName, threadId);
         console.log(`[${new Date().toLocaleTimeString()}] Fallback session recovered: ${exec.sessionId}${flabel}`);
@@ -1640,7 +1667,8 @@ async function execClaude(
     recoveredFromStale = true;
   }
 
-  const rateLimitMessage = extractRateLimitMessage(rawStdout, stderr);
+  // Only a failed run is rate limited: a successful reply may merely quote the limit phrase.
+  const rateLimitMessage = exitCode !== 0 ? extractRateLimitMessage(rawStdout, stderr) : null;
 
   if (rateLimitMessage) {
     stdout = rateLimitMessage;
