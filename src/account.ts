@@ -10,7 +10,12 @@ import { getSettings } from "./config";
 let primaryLimitedUntil = 0; // epoch ms; 0 = primary account usable
 
 function tokenFilePath(): string {
-  const raw = getSettings().fallback?.oauthTokenFile?.trim() ?? "";
+  let raw = "";
+  try {
+    raw = getSettings().fallback?.oauthTokenFile?.trim() ?? "";
+  } catch {
+    return ""; // settings not loaded (one-off CLI paths, tests): no fallback account
+  }
   if (raw === "~") return homedir();
   return raw.startsWith("~/") ? homedir() + raw.slice(1) : raw;
 }

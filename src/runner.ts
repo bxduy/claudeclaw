@@ -29,6 +29,7 @@ import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
+import { applyAccountEnv, switchToFallbackAccount } from "./account";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
@@ -115,7 +116,8 @@ function cleanSpawnEnv(): Record<string, string> {
     if (stripped.has(key)) continue;
     if (typeof value === "string") out[key] = value;
   }
-  return out;
+  // Re-add CLAUDE_CODE_OAUTH_TOKEN only from settings.fallback.oauthTokenFile, while the primary account is rate limited.
+  return applyAccountEnv(out);
 }
 
 export type CompactEvent =
@@ -189,6 +191,17 @@ function stripResume(args: string[]): string[] {
 }
 
 /** Replace the value following --output-format (returns a modified copy). */
+const ACCOUNT_SWITCH_NOTE =
+  "[ClaudeClaw: the previous attempt at this message stopped at a usage limit and is being retried on another Claude account. If you already started on it in this session, continue from where you stopped instead of starting over.]\n\n";
+
+/** Replace the `-p` prompt argument. */
+function withPrompt(args: string[], prompt: string): string[] {
+  const out = [...args];
+  const idx = out.indexOf("-p");
+  if (idx !== -1 && idx + 1 < out.length) out[idx + 1] = prompt;
+  return out;
+}
+
 function withOutputFormat(args: string[], format: string): string[] {
   const out = [...args];
   const idx = out.indexOf("--output-format");
@@ -917,7 +930,8 @@ export async function runTaskClaude(opts: TaskRunOptions): Promise<TaskRunResult
     const rateLimitMessage = extractRateLimitMessage(result, stderr);
     if (rateLimitMessage) {
       reason = "rate_limit";
-      noteRateLimit(rateLimitMessage);
+      // With a fallback account to switch to, later spawns keep running; only pause when there is none.
+      if (!switchToFallbackAccount(parseRateLimitResetTime(rateLimitMessage))) noteRateLimit(rateLimitMessage);
     }
   }
 
@@ -1470,12 +1484,20 @@ async function execClaude(
     args.push("--append-system-prompt", appendParts.join("\n\n"));
   }
 
-  const baseEnv = cleanSpawnEnv();
+  let baseEnv = cleanSpawnEnv();
   const spawnCwd = agentName ? await ensureAgentDir(agentName) : undefined;
 
   let exec = await runClaudeStream(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
-  const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+  let primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
+
+  // Primary account hit its limit: rerun the same session on the fallback account.
+  if (primaryRateLimit && switchToFallbackAccount(parseRateLimitResetTime(primaryRateLimit))) {
+    baseEnv = cleanSpawnEnv();
+    const accountArgs = withPrompt(args, ACCOUNT_SWITCH_NOTE + prompt);
+    exec = await runClaudeStream(accountArgs, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, spawnCwd, onChunk, onToolEvent);
+    primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
+  }
 
   if (primaryRateLimit && hasModelConfig(fallbackConfig) && !sameModelConfig(primaryConfig, fallbackConfig)) {
     console.warn(

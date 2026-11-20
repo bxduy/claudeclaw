@@ -2,6 +2,7 @@ import { mkdir } from "fs/promises";
 import { join } from "path";
 import { existsSync } from "fs";
 import { peekSession, backupSession, resetSession } from "./sessions";
+import { applyAccountEnv } from "./account";
 import type { GlobalSession } from "./sessions";
 
 const SUMMARY_TIMEOUT_MS = 60_000;
@@ -24,7 +25,7 @@ function cleanEnv(): Record<string, string> {
     if (STRIPPED_ENV_KEYS.has(key)) continue;
     if (typeof value === "string") out[key] = value;
   }
-  return out;
+  return applyAccountEnv(out);
 }
 
 export function needsRotation(session: GlobalSession, config: SessionConfig): boolean {
